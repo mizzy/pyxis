@@ -79,6 +79,5 @@ lm_head.weight                                 # output head (may be tied to emb
 
 ## Code Style
 
-- Commit messages in English
-- Code comments in English
+- All written output in English: commit messages, code comments, PR titles, PR descriptions, and GitHub issue content
 - No unnecessary abstractions — straightforward, readable math code
