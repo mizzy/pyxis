@@ -73,6 +73,10 @@ model.norm.weight                              # final RMSNorm
 lm_head.weight                                 # output head (may be tied to embed_tokens)
 ```
 
+## Git & PR Workflow
+
+- PRs are created as regular (non-draft) PRs unless explicitly told otherwise.
+
 ## Code Style
 
 - Commit messages in English
