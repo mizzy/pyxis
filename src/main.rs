@@ -1,12 +1,14 @@
-mod display;
-mod safetensors;
-
 use std::path::Path;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("Usage: pyxis <model.safetensors>");
-    let tensors =
-        safetensors::parse_header(Path::new(&path)).expect("Failed to parse safetensors header");
+    let path = std::env::args()
+        .nth(1)
+        .expect("Usage: pyxis <model.safetensors>");
+    let safetensors = pyxis::safetensors::SafeTensors::load(Path::new(&path))
+        .expect("Failed to load safetensors file");
 
-    print!("{}", display::format_tensor_table(&tensors));
+    print!(
+        "{}",
+        pyxis::display::format_tensor_table(safetensors.tensors())
+    );
 }
