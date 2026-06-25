@@ -19,7 +19,7 @@ pub fn format_tensor_table(tensors: &HashMap<String, TensorInfo>) -> String {
             let [start, end] = info.data_offsets;
             [
                 name.to_string(),
-                info.dtype.clone(),
+                format!("{:?}", info.dtype),
                 format!("{:?}", info.shape),
                 format!("{}..{}", start, end),
             ]
@@ -81,10 +81,11 @@ pub fn format_tensor_table(tensors: &HashMap<String, TensorInfo>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safetensors::Dtype;
 
-    fn make_tensor(dtype: &str, shape: Vec<usize>, offsets: [usize; 2]) -> TensorInfo {
+    fn make_tensor(dtype: Dtype, shape: Vec<usize>, offsets: [usize; 2]) -> TensorInfo {
         TensorInfo {
-            dtype: dtype.to_string(),
+            dtype,
             shape,
             data_offsets: offsets,
         }
@@ -93,8 +94,11 @@ mod tests {
     #[test]
     fn columns_auto_size_to_short_names() {
         let mut tensors = HashMap::new();
-        tensors.insert("w".to_string(), make_tensor("F32", vec![3, 4], [0, 48]));
-        tensors.insert("b".to_string(), make_tensor("F32", vec![4], [48, 64]));
+        tensors.insert(
+            "w".to_string(),
+            make_tensor(Dtype::F32, vec![3, 4], [0, 48]),
+        );
+        tensors.insert("b".to_string(), make_tensor(Dtype::F32, vec![4], [48, 64]));
 
         let output = format_tensor_table(&tensors);
         let lines: Vec<&str> = output.lines().collect();
@@ -115,11 +119,11 @@ mod tests {
         let mut tensors = HashMap::new();
         tensors.insert(
             "model.layers.0.self_attn.q_proj.weight".to_string(),
-            make_tensor("BF16", vec![2048, 2048], [0, 8388608]),
+            make_tensor(Dtype::BF16, vec![2048, 2048], [0, 8388608]),
         );
         tensors.insert(
             "model.embed_tokens.weight".to_string(),
-            make_tensor("BF16", vec![151936, 2048], [8388608, 931135488]),
+            make_tensor(Dtype::BF16, vec![151936, 2048], [8388608, 931135488]),
         );
 
         let output = format_tensor_table(&tensors);
@@ -153,9 +157,18 @@ mod tests {
     #[test]
     fn rows_are_sorted_alphabetically() {
         let mut tensors = HashMap::new();
-        tensors.insert("z_tensor".to_string(), make_tensor("F32", vec![1], [0, 4]));
-        tensors.insert("a_tensor".to_string(), make_tensor("F32", vec![2], [4, 12]));
-        tensors.insert("m_tensor".to_string(), make_tensor("F32", vec![3], [12, 24]));
+        tensors.insert(
+            "z_tensor".to_string(),
+            make_tensor(Dtype::F32, vec![1], [0, 4]),
+        );
+        tensors.insert(
+            "a_tensor".to_string(),
+            make_tensor(Dtype::F32, vec![2], [4, 12]),
+        );
+        tensors.insert(
+            "m_tensor".to_string(),
+            make_tensor(Dtype::F32, vec![3], [12, 24]),
+        );
 
         let output = format_tensor_table(&tensors);
         let lines: Vec<&str> = output.lines().collect();
@@ -168,10 +181,13 @@ mod tests {
     #[test]
     fn all_rows_have_same_length() {
         let mut tensors = HashMap::new();
-        tensors.insert("short".to_string(), make_tensor("F32", vec![1], [0, 4]));
+        tensors.insert(
+            "short".to_string(),
+            make_tensor(Dtype::F32, vec![1], [0, 4]),
+        );
         tensors.insert(
             "a_very_long_tensor_name_that_exceeds_everything".to_string(),
-            make_tensor("BF16", vec![1024, 1024, 3], [4, 12582916]),
+            make_tensor(Dtype::BF16, vec![1024, 1024, 3], [4, 12582916]),
         );
 
         let output = format_tensor_table(&tensors);
