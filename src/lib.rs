@@ -2,6 +2,7 @@ pub mod attention;
 pub mod display;
 pub mod embedding;
 pub mod ffn;
+pub mod kv_cache;
 pub mod model;
 pub mod output_head;
 pub mod rmsnorm;
