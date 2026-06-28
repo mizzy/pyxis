@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
@@ -40,6 +40,99 @@ pub struct SafeTensors {
     mmap: memmap2::Mmap,
     data_offset: usize,
     tensors: HashMap<String, TensorInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafeTensorsIndex {
+    weight_map: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+pub struct ShardedSafeTensors {
+    shards: Vec<SafeTensors>,
+    tensor_to_shard: HashMap<String, usize>,
+}
+
+impl ShardedSafeTensors {
+    pub fn load(index_path: &Path) -> io::Result<Self> {
+        let json = fs::read_to_string(index_path)?;
+        let index: SafeTensorsIndex = serde_json::from_str(&json)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let model_dir = index_path.parent().unwrap_or_else(|| Path::new(""));
+
+        let mut shards = Vec::new();
+        let mut shard_to_index = HashMap::new();
+        let mut tensor_to_shard = HashMap::new();
+
+        for (tensor_name, shard_file) in index.weight_map {
+            let shard_index = if let Some(shard_index) = shard_to_index.get(&shard_file) {
+                *shard_index
+            } else {
+                let shard_path = model_dir.join(&shard_file);
+                let shard_index = shards.len();
+                shards.push(SafeTensors::load(&shard_path)?);
+                shard_to_index.insert(shard_file, shard_index);
+                shard_index
+            };
+            tensor_to_shard.insert(tensor_name, shard_index);
+        }
+
+        Ok(Self {
+            shards,
+            tensor_to_shard,
+        })
+    }
+
+    pub fn tensor_f32(&self, name: &str) -> io::Result<Vec<f32>> {
+        let shard_index = self.tensor_to_shard.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("tensor not found: {name}"))
+        })?;
+        self.shards[*shard_index].tensor_f32(name)
+    }
+}
+
+#[derive(Debug)]
+pub enum TensorStore {
+    Single(SafeTensors),
+    Sharded(ShardedSafeTensors),
+}
+
+impl TensorStore {
+    pub fn load(model_dir: &Path) -> io::Result<Self> {
+        let single_path = model_dir.join("model.safetensors");
+        let index_path = model_dir.join("model.safetensors.index.json");
+
+        if single_path.exists() {
+            return Ok(Self::Single(SafeTensors::load(&single_path)?));
+        }
+
+        if index_path.exists() {
+            return Ok(Self::Sharded(ShardedSafeTensors::load(&index_path)?));
+        }
+
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(model_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors") {
+                candidates.push(path);
+            }
+        }
+        candidates.sort();
+
+        let path = candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no safetensors file found"))?;
+
+        Ok(Self::Single(SafeTensors::load(&path)?))
+    }
+
+    pub fn tensor_f32(&self, name: &str) -> io::Result<Vec<f32>> {
+        match self {
+            Self::Single(safetensors) => safetensors.tensor_f32(name),
+            Self::Sharded(safetensors) => safetensors.tensor_f32(name),
+        }
+    }
 }
 
 impl SafeTensors {
@@ -160,6 +253,7 @@ impl SafeTensors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -173,6 +267,140 @@ mod tests {
         file.write_all(data).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    fn write_test_safetensors(path: &Path, tensors: serde_json::Value, data: &[u8]) {
+        let header_bytes = serde_json::to_vec(&tensors).unwrap();
+        let header_size = (header_bytes.len() as u64).to_le_bytes();
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&header_size).unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(data).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn sharded_index_deserializes() {
+        let index = serde_json::from_str::<SafeTensorsIndex>(
+            r#"{
+                "metadata": {"total_size": 24},
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                    "lm_head.weight": "model-00002-of-00002.safetensors"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(index.weight_map.len(), 2);
+        assert_eq!(
+            index.weight_map["model.embed_tokens.weight"],
+            "model-00001-of-00002.safetensors"
+        );
+        assert_eq!(
+            index.weight_map["lm_head.weight"],
+            "model-00002-of-00002.safetensors"
+        );
+    }
+
+    #[test]
+    fn tensor_store_loads_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_safetensors(
+            &dir.path().join("model.safetensors"),
+            serde_json::json!({
+                "values": {
+                    "dtype": "F32",
+                    "shape": [2],
+                    "data_offsets": [0, 8]
+                }
+            }),
+            &f32_bytes(&[1.0, 2.0]),
+        );
+
+        let store = TensorStore::load(dir.path()).unwrap();
+
+        assert!(matches!(store, TensorStore::Single(_)));
+        assert_eq!(store.tensor_f32("values").unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn tensor_store_loads_sharded() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_1 = "model-00001-of-00002.safetensors";
+        let shard_2 = "model-00002-of-00002.safetensors";
+
+        write_test_safetensors(
+            &dir.path().join(shard_1),
+            serde_json::json!({
+                "first.weight": {
+                    "dtype": "F32",
+                    "shape": [2],
+                    "data_offsets": [0, 8]
+                },
+                "shared.weight": {
+                    "dtype": "F32",
+                    "shape": [1],
+                    "data_offsets": [8, 12]
+                }
+            }),
+            &f32_bytes(&[1.0, 2.0, 9.0]),
+        );
+        write_test_safetensors(
+            &dir.path().join(shard_2),
+            serde_json::json!({
+                "second.weight": {
+                    "dtype": "F32",
+                    "shape": [3],
+                    "data_offsets": [0, 12]
+                }
+            }),
+            &f32_bytes(&[3.0, 4.0, 5.0]),
+        );
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({
+                "metadata": {"total_size": 20},
+                "weight_map": {
+                    "first.weight": shard_1,
+                    "shared.weight": shard_1,
+                    "second.weight": shard_2
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = TensorStore::load(dir.path()).unwrap();
+
+        let TensorStore::Sharded(sharded) = &store else {
+            panic!("expected sharded tensor store");
+        };
+        assert_eq!(sharded.shards.len(), 2);
+        assert_eq!(store.tensor_f32("first.weight").unwrap(), vec![1.0, 2.0]);
+        assert_eq!(store.tensor_f32("shared.weight").unwrap(), vec![9.0]);
+        assert_eq!(
+            store.tensor_f32("second.weight").unwrap(),
+            vec![3.0, 4.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn tensor_store_errors_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = TensorStore::load(dir.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("no safetensors file found"));
     }
 
     #[test]

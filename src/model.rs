@@ -4,14 +4,14 @@ use crate::ffn::Ffn;
 use crate::kv_cache::KvCache;
 use crate::output_head::OutputHead;
 use crate::rmsnorm::RmsNorm;
-use crate::safetensors::SafeTensors;
+use crate::safetensors::TensorStore;
 use crate::sampler::Sampler;
 use crate::tokenizer::PyxisTokenizer;
 use crate::transformer::{Transformer, TransformerBlock};
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const QWEN3_EOS_TOKEN_ID: u32 = 151_645;
 
@@ -45,9 +45,9 @@ impl Model {
     pub fn load(model_dir: &Path) -> io::Result<Self> {
         let tokenizer = PyxisTokenizer::load(&model_dir.join("tokenizer.json"))?;
         let config = read_config(&model_dir.join("config.json"))?;
-        let tensors = SafeTensors::load(&find_safetensors_file(model_dir)?)?;
+        let tensor_store = TensorStore::load(model_dir)?;
 
-        let embed_tokens_weight = tensors.tensor_f32("model.embed_tokens.weight")?;
+        let embed_tokens_weight = tensor_store.tensor_f32("model.embed_tokens.weight")?;
         let embedding = Embedding::new(
             embed_tokens_weight.clone(),
             config.vocab_size,
@@ -57,14 +57,19 @@ impl Model {
         let mut blocks = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             let input_norm = RmsNorm::new(
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?,
                 config.rms_norm_eps,
             );
             let attention = Attention::new(
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
                 config.hidden_size,
                 config.num_attention_heads,
                 config.num_key_value_heads,
@@ -72,15 +77,17 @@ impl Model {
                 config.rope_theta,
             );
             let post_attn_norm = RmsNorm::new(
-                tensors.tensor_f32(&format!(
+                tensor_store.tensor_f32(&format!(
                     "model.layers.{layer_idx}.post_attention_layernorm.weight"
                 ))?,
                 config.rms_norm_eps,
             );
             let ffn = Ffn::new(
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.mlp.gate_proj.weight"))?,
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
-                tensors.tensor_f32(&format!("model.layers.{layer_idx}.mlp.down_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.mlp.gate_proj.weight"))?,
+                tensor_store.tensor_f32(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
+                tensor_store
+                    .tensor_f32(&format!("model.layers.{layer_idx}.mlp.down_proj.weight"))?,
                 config.hidden_size,
                 config.intermediate_size,
             );
@@ -94,14 +101,14 @@ impl Model {
         }
 
         let final_norm = RmsNorm::new(
-            tensors.tensor_f32("model.norm.weight")?,
+            tensor_store.tensor_f32("model.norm.weight")?,
             config.rms_norm_eps,
         );
         let transformer = Transformer::new(blocks, final_norm, config.hidden_size);
         let output_weight = if config.tie_word_embeddings {
             embed_tokens_weight
         } else {
-            tensors.tensor_f32("lm_head.weight")?
+            tensor_store.tensor_f32("lm_head.weight")?
         };
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
         let sampler = Sampler::new(1.2);
@@ -171,38 +178,9 @@ fn read_config(path: &Path) -> io::Result<ModelConfig> {
     serde_json::from_str(&json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn find_safetensors_file(model_dir: &Path) -> io::Result<PathBuf> {
-    let model_file = model_dir.join("model.safetensors");
-    if model_file.exists() {
-        return Ok(model_file);
-    }
-
-    if model_dir.join("model.safetensors.index.json").exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "sharded models not supported",
-        ));
-    }
-
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(model_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors") {
-            candidates.push(path);
-        }
-    }
-    candidates.sort();
-
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no safetensors file found"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
 
     #[test]
     fn model_config_deserializes() {
@@ -232,35 +210,5 @@ mod tests {
         assert_eq!(config.rope_theta, 1_000_000.0);
         assert_eq!(config.vocab_size, 151_936);
         assert!(config.tie_word_embeddings);
-    }
-
-    #[test]
-    fn find_safetensors_file_returns_single_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let model_file = dir.path().join("model.safetensors");
-        File::create(&model_file).unwrap();
-
-        let path = find_safetensors_file(dir.path()).unwrap();
-
-        assert_eq!(path, model_file);
-    }
-
-    #[test]
-    fn find_safetensors_file_errors_on_sharded() {
-        let dir = tempfile::tempdir().unwrap();
-        File::create(dir.path().join("model.safetensors.index.json")).unwrap();
-
-        let error = find_safetensors_file(dir.path()).unwrap_err();
-
-        assert!(error.to_string().contains("sharded models not supported"));
-    }
-
-    #[test]
-    fn find_safetensors_file_errors_on_missing() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let error = find_safetensors_file(dir.path()).unwrap_err();
-
-        assert!(error.to_string().contains("no safetensors file found"));
     }
 }
