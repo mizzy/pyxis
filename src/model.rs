@@ -5,6 +5,7 @@ use crate::kv_cache::KvCache;
 use crate::output_head::OutputHead;
 use crate::rmsnorm::RmsNorm;
 use crate::safetensors::SafeTensors;
+use crate::sampler::Sampler;
 use crate::tokenizer::PyxisTokenizer;
 use crate::transformer::{Transformer, TransformerBlock};
 use serde::Deserialize;
@@ -19,6 +20,7 @@ pub struct Model {
     embedding: Embedding,
     transformer: Transformer,
     output_head: OutputHead,
+    sampler: Sampler,
     hidden_dim: usize,
     num_layers: usize,
     kv_dim: usize,
@@ -102,12 +104,14 @@ impl Model {
             tensors.tensor_f32("lm_head.weight")?
         };
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
+        let sampler = Sampler::new(1.2);
 
         Ok(Self {
             tokenizer,
             embedding,
             transformer,
             output_head,
+            sampler,
             hidden_dim: config.hidden_size,
             num_layers: config.num_hidden_layers,
             kv_dim: config.num_key_value_heads * config.head_dim,
@@ -136,7 +140,8 @@ impl Model {
         self.transformer.forward(&mut x, seq_len, 0, &mut kv_cache);
         let last_start = (seq_len - 1) * self.hidden_dim;
         let last_hidden = &x[last_start..last_start + self.hidden_dim];
-        let mut next_token_id = self.output_head.greedy(last_hidden) as u32;
+        let mut logits = self.output_head.logits(last_hidden);
+        let mut next_token_id = self.sampler.sample(&mut logits, &token_ids) as u32;
 
         for _ in 0..max_tokens {
             if next_token_id == self.eos_token_id {
@@ -153,7 +158,8 @@ impl Model {
             let start_pos = token_ids.len() - 1;
             self.transformer
                 .forward(&mut x, 1, start_pos, &mut kv_cache);
-            next_token_id = self.output_head.greedy(&x) as u32;
+            let mut logits = self.output_head.logits(&x);
+            next_token_id = self.sampler.sample(&mut logits, &token_ids) as u32;
         }
 
         self.tokenizer.decode(&generated_token_ids)

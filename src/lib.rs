@@ -7,5 +7,6 @@ pub mod model;
 pub mod output_head;
 pub mod rmsnorm;
 pub mod safetensors;
+pub mod sampler;
 pub mod tokenizer;
 pub mod transformer;
