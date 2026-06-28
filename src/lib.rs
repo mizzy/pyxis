@@ -4,3 +4,4 @@ pub mod embedding;
 pub mod ffn;
 pub mod rmsnorm;
 pub mod safetensors;
+pub mod transformer;
