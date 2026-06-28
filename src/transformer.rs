@@ -121,12 +121,18 @@ mod tests {
         RmsNorm::new(vec![1.0; HIDDEN_DIM], EPS)
     }
 
+    fn attention_norm() -> RmsNorm {
+        RmsNorm::new(vec![1.0; HEAD_DIM], EPS)
+    }
+
     fn zero_attention() -> Attention {
         Attention::new(
             vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
             vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
             vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
             vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
+            attention_norm(),
+            attention_norm(),
             HIDDEN_DIM,
             NUM_Q_HEADS,
             NUM_KV_HEADS,
@@ -141,6 +147,8 @@ mod tests {
             identity_weight(HIDDEN_DIM),
             identity_weight(HIDDEN_DIM),
             identity_weight(HIDDEN_DIM),
+            attention_norm(),
+            attention_norm(),
             HIDDEN_DIM,
             NUM_Q_HEADS,
             NUM_KV_HEADS,
