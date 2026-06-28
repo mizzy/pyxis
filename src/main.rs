@@ -1,14 +1,16 @@
 use std::path::Path;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("Usage: pyxis <model.safetensors>");
-    let safetensors = pyxis::safetensors::SafeTensors::load(Path::new(&path))
-        .expect("Failed to load safetensors file");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: pyxis <model-dir> [prompt]");
+        std::process::exit(1);
+    }
 
-    print!(
-        "{}",
-        pyxis::display::format_tensor_table(safetensors.tensors())
-    );
+    let model_dir = &args[1];
+    let prompt = args.get(2).map_or("Hello", |s| s.as_str());
+
+    let model = pyxis::model::Model::load(Path::new(model_dir)).expect("Failed to load model");
+    model.generate(prompt, 50);
+    println!();
 }
