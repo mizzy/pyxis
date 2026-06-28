@@ -1,6 +1,7 @@
 use crate::attention::Attention;
 use crate::embedding::Embedding;
 use crate::ffn::Ffn;
+use crate::kv_cache::KvCache;
 use crate::output_head::OutputHead;
 use crate::rmsnorm::RmsNorm;
 use crate::safetensors::SafeTensors;
@@ -19,6 +20,8 @@ pub struct Model {
     transformer: Transformer,
     output_head: OutputHead,
     hidden_dim: usize,
+    num_layers: usize,
+    kv_dim: usize,
     eos_token_id: u32,
 }
 
@@ -106,32 +109,36 @@ impl Model {
             transformer,
             output_head,
             hidden_dim: config.hidden_size,
+            num_layers: config.num_hidden_layers,
+            kv_dim: config.num_key_value_heads * config.head_dim,
             eos_token_id: QWEN3_EOS_TOKEN_ID,
         })
     }
 
+    pub fn new_kv_cache(&self) -> KvCache {
+        KvCache::new(self.num_layers, self.kv_dim)
+    }
+
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> String {
         let mut token_ids = self.tokenizer.encode(prompt);
+        let mut kv_cache = self.new_kv_cache();
         let mut generated_token_ids = Vec::new();
 
-        if token_ids.is_empty() {
+        if token_ids.is_empty() || max_tokens == 0 {
             return String::new();
         }
 
+        let seq_len = token_ids.len();
+        let mut x = Vec::with_capacity(seq_len * self.hidden_dim);
+        for token_id in &token_ids {
+            x.extend_from_slice(self.embedding.lookup(*token_id as usize));
+        }
+        self.transformer.forward(&mut x, seq_len, 0, &mut kv_cache);
+        let last_start = (seq_len - 1) * self.hidden_dim;
+        let last_hidden = &x[last_start..last_start + self.hidden_dim];
+        let mut next_token_id = self.output_head.greedy(last_hidden) as u32;
+
         for _ in 0..max_tokens {
-            let seq_len = token_ids.len();
-            let mut x = Vec::with_capacity(seq_len * self.hidden_dim);
-
-            for token_id in &token_ids {
-                x.extend_from_slice(self.embedding.lookup(*token_id as usize));
-            }
-
-            self.transformer.forward(&mut x, seq_len);
-
-            let last_start = (seq_len - 1) * self.hidden_dim;
-            let last_hidden = &x[last_start..last_start + self.hidden_dim];
-            let next_token_id = self.output_head.greedy(last_hidden) as u32;
-
             if next_token_id == self.eos_token_id {
                 break;
             }
@@ -141,6 +148,12 @@ impl Model {
 
             generated_token_ids.push(next_token_id);
             token_ids.push(next_token_id);
+
+            let mut x = self.embedding.lookup(next_token_id as usize).to_vec();
+            let start_pos = token_ids.len() - 1;
+            self.transformer
+                .forward(&mut x, 1, start_pos, &mut kv_cache);
+            next_token_id = self.output_head.greedy(&x) as u32;
         }
 
         self.tokenizer.decode(&generated_token_ids)

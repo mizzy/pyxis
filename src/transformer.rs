@@ -1,5 +1,6 @@
 use crate::attention::Attention;
 use crate::ffn::Ffn;
+use crate::kv_cache::{KvCache, LayerCache};
 use crate::rmsnorm::RmsNorm;
 
 pub struct TransformerBlock {
@@ -24,7 +25,7 @@ impl TransformerBlock {
         }
     }
 
-    pub fn forward(&self, x: &mut [f32], seq_len: usize) {
+    pub fn forward(&self, x: &mut [f32], seq_len: usize, start_pos: usize, cache: &mut LayerCache) {
         assert!(seq_len > 0);
         assert_eq!(x.len() % seq_len, 0);
         let hidden_dim = x.len() / seq_len;
@@ -34,7 +35,7 @@ impl TransformerBlock {
             self.input_norm.forward(position);
         }
 
-        let attention_output = self.attention.forward(x, seq_len);
+        let attention_output = self.attention.forward(x, seq_len, start_pos, cache);
         assert_eq!(attention_output.len(), x.len());
         for ((value, residual), attention) in x.iter_mut().zip(residual).zip(attention_output) {
             *value = residual + attention;
@@ -76,11 +77,11 @@ impl Transformer {
         }
     }
 
-    pub fn forward(&self, x: &mut [f32], seq_len: usize) {
+    pub fn forward(&self, x: &mut [f32], seq_len: usize, start_pos: usize, kv_cache: &mut KvCache) {
         assert_eq!(x.len(), seq_len * self.hidden_dim);
 
-        for block in &self.blocks {
-            block.forward(x, seq_len);
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            block.forward(x, seq_len, start_pos, kv_cache.layer_mut(block_idx));
         }
 
         for position in x.chunks_exact_mut(self.hidden_dim) {
@@ -92,6 +93,7 @@ impl Transformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::{KvCache, LayerCache};
 
     const HIDDEN_DIM: usize = 4;
     const NUM_Q_HEADS: usize = 2;
@@ -180,8 +182,9 @@ mod tests {
         let block = zero_block();
         let mut x = vec![1.0, 2.0, 3.0, 4.0];
         let expected = x.clone();
+        let mut cache = LayerCache::new(HIDDEN_DIM);
 
-        block.forward(&mut x, 1);
+        block.forward(&mut x, 1, 0, &mut cache);
 
         assert_vec_close(&x, &expected);
     }
@@ -191,8 +194,9 @@ mod tests {
         let block = zero_block();
         let mut x = vec![1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0];
         let expected = x.clone();
+        let mut cache = LayerCache::new(HIDDEN_DIM);
 
-        block.forward(&mut x, 2);
+        block.forward(&mut x, 2, 0, &mut cache);
 
         assert_vec_close(&x, &expected);
     }
@@ -202,8 +206,9 @@ mod tests {
         let transformer = Transformer::new(vec![zero_block(), zero_block()], norm(), HIDDEN_DIM);
         let mut x = vec![1.0, 2.0, 3.0, 4.0];
         let expected = rms_norm_values(&x);
+        let mut cache = KvCache::new(2, HIDDEN_DIM);
 
-        transformer.forward(&mut x, 1);
+        transformer.forward(&mut x, 1, 0, &mut cache);
 
         assert_vec_close(&x, &expected);
     }
@@ -219,8 +224,9 @@ mod tests {
             .zip(expected_attention)
             .map(|(residual, attention)| residual + attention)
             .collect();
+        let mut cache = LayerCache::new(HIDDEN_DIM);
 
-        block.forward(&mut x, 1);
+        block.forward(&mut x, 1, 0, &mut cache);
 
         assert_ne!(x, input);
         assert_vec_close(&x, &expected);

@@ -1,3 +1,5 @@
+use crate::kv_cache::LayerCache;
+
 pub struct Attention {
     wq: Vec<f32>,
     wk: Vec<f32>,
@@ -43,15 +45,22 @@ impl Attention {
         }
     }
 
-    pub fn forward(&self, x: &[f32], seq_len: usize) -> Vec<f32> {
+    pub fn forward(
+        &self,
+        x: &[f32],
+        seq_len: usize,
+        start_pos: usize,
+        cache: &mut LayerCache,
+    ) -> Vec<f32> {
         let hidden_dim = self.hidden_dim;
         let q_dim = self.num_q_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         assert_eq!(x.len(), seq_len * hidden_dim);
+        assert_eq!(cache.len(), start_pos);
 
         let mut queries = vec![0.0; seq_len * q_dim];
-        let mut keys = vec![0.0; seq_len * kv_dim];
-        let mut values = vec![0.0; seq_len * kv_dim];
+        let mut new_keys = vec![0.0; seq_len * kv_dim];
+        let mut new_values = vec![0.0; seq_len * kv_dim];
 
         for pos in 0..seq_len {
             let input = &x[pos * hidden_dim..(pos + 1) * hidden_dim];
@@ -60,14 +69,18 @@ impl Attention {
             let mut key = matmul(input, &self.wk, kv_dim, hidden_dim);
             let value = matmul(input, &self.wv, kv_dim, hidden_dim);
 
-            apply_rope(&mut query, self.head_dim, pos, self.rope_theta);
-            apply_rope(&mut key, self.head_dim, pos, self.rope_theta);
+            apply_rope(&mut query, self.head_dim, start_pos + pos, self.rope_theta);
+            apply_rope(&mut key, self.head_dim, start_pos + pos, self.rope_theta);
 
             queries[pos * q_dim..(pos + 1) * q_dim].copy_from_slice(&query);
-            keys[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&key);
-            values[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&value);
+            new_keys[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&key);
+            new_values[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&value);
         }
 
+        cache.append(&new_keys, &new_values, seq_len);
+        let cached_len = cache.len();
+        let keys = cache.keys();
+        let values = cache.values();
         let mut output = vec![0.0; seq_len * hidden_dim];
         let scale = (self.head_dim as f32).sqrt();
 
@@ -77,9 +90,10 @@ impl Attention {
             for q_head in 0..self.num_q_heads {
                 let kv_head = q_head * self.num_kv_heads / self.num_q_heads;
                 let q_start = pos * q_dim + q_head * self.head_dim;
-                let mut scores = vec![f32::NEG_INFINITY; seq_len];
+                let mut scores = vec![f32::NEG_INFINITY; cached_len];
+                let max_key_pos = start_pos + pos;
 
-                for (key_pos, score) in scores.iter_mut().enumerate().take(pos + 1) {
+                for (key_pos, score) in scores.iter_mut().enumerate().take(max_key_pos + 1) {
                     let k_start = key_pos * kv_dim + kv_head * self.head_dim;
                     let dot = (0..self.head_dim)
                         .map(|dim| queries[q_start + dim] * keys[k_start + dim])
@@ -90,7 +104,7 @@ impl Attention {
                 softmax(&mut scores);
 
                 let out_start = q_head * self.head_dim;
-                for (key_pos, score) in scores.iter().enumerate().take(pos + 1) {
+                for (key_pos, score) in scores.iter().enumerate() {
                     let v_start = key_pos * kv_dim + kv_head * self.head_dim;
 
                     for dim in 0..self.head_dim {
@@ -164,6 +178,7 @@ fn softmax(scores: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::LayerCache;
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(
@@ -258,8 +273,9 @@ mod tests {
             10.0,
         );
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut cache = LayerCache::new(hidden_dim);
 
-        let output = attention.forward(&x, 1);
+        let output = attention.forward(&x, 1, 0, &mut cache);
 
         assert_vec_close(&output, &x);
     }
@@ -281,8 +297,9 @@ mod tests {
         let x = vec![
             2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0,
         ];
+        let mut cache = LayerCache::new(hidden_dim);
 
-        let output = attention.forward(&x, 2);
+        let output = attention.forward(&x, 2, 0, &mut cache);
 
         assert_vec_close(&output[..hidden_dim], &x[..hidden_dim]);
         assert_vec_close(
@@ -319,8 +336,9 @@ mod tests {
             10.0,
         );
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut cache = LayerCache::new(kv_dim);
 
-        let output = attention.forward(&x, 2);
+        let output = attention.forward(&x, 2, 0, &mut cache);
 
         assert_eq!(output.len(), 2 * hidden_dim);
         assert_vec_close(&output, &[1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 6.0]);
@@ -342,9 +360,39 @@ mod tests {
             10.0,
         );
         let x = vec![1.0; hidden_dim * 3];
+        let mut cache = LayerCache::new(kv_dim);
 
-        let output = attention.forward(&x, 3);
+        let output = attention.forward(&x, 3, 0, &mut cache);
 
         assert_eq!(output.len(), hidden_dim * 3);
+    }
+
+    #[test]
+    fn forward_with_kv_cache_incremental() {
+        let hidden_dim = 8;
+        let attention = Attention::new(
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            hidden_dim,
+            2,
+            2,
+            4,
+            10.0,
+        );
+        let x = vec![
+            1.0, 0.5, -1.0, 2.0, 0.25, -0.5, 1.5, -2.0, -0.75, 1.25, 0.0, 0.5, 2.0, -1.0, 0.75,
+            -0.25, 0.3, -1.5, 1.2, 0.8, -0.4, 2.5, -0.9, 1.1,
+        ];
+        let mut full_cache = LayerCache::new(hidden_dim);
+        let full_output = attention.forward(&x, 3, 0, &mut full_cache);
+
+        let mut incremental_cache = LayerCache::new(hidden_dim);
+        let _ = attention.forward(&x[..2 * hidden_dim], 2, 0, &mut incremental_cache);
+        let incremental_output =
+            attention.forward(&x[2 * hidden_dim..], 1, 2, &mut incremental_cache);
+
+        assert_vec_close(&incremental_output, &full_output[2 * hidden_dim..]);
     }
 }
