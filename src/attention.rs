@@ -1,10 +1,13 @@
 use crate::kv_cache::LayerCache;
+use crate::rmsnorm::RmsNorm;
 
 pub struct Attention {
     wq: Vec<f32>,
     wk: Vec<f32>,
     wv: Vec<f32>,
     wo: Vec<f32>,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
     hidden_dim: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -19,6 +22,8 @@ impl Attention {
         wk: Vec<f32>,
         wv: Vec<f32>,
         wo: Vec<f32>,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
         hidden_dim: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -37,6 +42,8 @@ impl Attention {
             wk,
             wv,
             wo,
+            q_norm,
+            k_norm,
             hidden_dim,
             num_q_heads,
             num_kv_heads,
@@ -68,6 +75,13 @@ impl Attention {
             let mut query = matmul(input, &self.wq, q_dim, hidden_dim);
             let mut key = matmul(input, &self.wk, kv_dim, hidden_dim);
             let value = matmul(input, &self.wv, kv_dim, hidden_dim);
+
+            for head in query.chunks_exact_mut(self.head_dim) {
+                self.q_norm.forward(head);
+            }
+            for head in key.chunks_exact_mut(self.head_dim) {
+                self.k_norm.forward(head);
+            }
 
             apply_rope(&mut query, self.head_dim, start_pos + pos, self.rope_theta);
             apply_rope(&mut key, self.head_dim, start_pos + pos, self.rope_theta);
@@ -179,6 +193,7 @@ fn softmax(scores: &mut [f32]) {
 mod tests {
     use super::*;
     use crate::kv_cache::LayerCache;
+    use crate::rmsnorm::RmsNorm;
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(
@@ -201,6 +216,14 @@ mod tests {
             weight[i * size + i] = 1.0;
         }
         weight
+    }
+
+    fn head_norm(weight: Vec<f32>) -> RmsNorm {
+        RmsNorm::new(weight, 1e-6)
+    }
+
+    fn unit_head_norm(head_dim: usize) -> RmsNorm {
+        head_norm(vec![1.0; head_dim])
     }
 
     #[test]
@@ -266,6 +289,8 @@ mod tests {
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
+            unit_head_norm(4),
+            unit_head_norm(4),
             hidden_dim,
             2,
             2,
@@ -288,6 +313,8 @@ mod tests {
             vec![0.0; hidden_dim * hidden_dim],
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
+            unit_head_norm(4),
+            unit_head_norm(4),
             hidden_dim,
             2,
             2,
@@ -329,6 +356,8 @@ mod tests {
             vec![0.0; kv_dim * hidden_dim],
             wv,
             wo,
+            unit_head_norm(head_dim),
+            unit_head_norm(head_dim),
             hidden_dim,
             num_q_heads,
             num_kv_heads,
@@ -353,6 +382,8 @@ mod tests {
             vec![0.0; kv_dim * hidden_dim],
             vec![0.0; kv_dim * hidden_dim],
             vec![0.0; hidden_dim * hidden_dim],
+            unit_head_norm(4),
+            unit_head_norm(4),
             hidden_dim,
             4,
             2,
@@ -375,6 +406,8 @@ mod tests {
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
+            unit_head_norm(4),
+            unit_head_norm(4),
             hidden_dim,
             2,
             2,
@@ -394,5 +427,64 @@ mod tests {
             attention.forward(&x[2 * hidden_dim..], 1, 2, &mut incremental_cache);
 
         assert_vec_close(&incremental_output, &full_output[2 * hidden_dim..]);
+    }
+
+    #[test]
+    fn qk_norm_is_applied_per_head() {
+        let hidden_dim = 8;
+        let head_dim = 4;
+        let input = vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let k_norm_weight = vec![1.0, 2.0, 3.0, 4.0];
+        let mut base_cache = LayerCache::new(hidden_dim);
+        let base_attention = Attention::new(
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            head_norm(vec![1.0; head_dim]),
+            head_norm(k_norm_weight.clone()),
+            hidden_dim,
+            2,
+            2,
+            head_dim,
+            10.0,
+        );
+        let base_output = base_attention.forward(&input, 2, 0, &mut base_cache);
+
+        let mut scaled_cache = LayerCache::new(hidden_dim);
+        let scaled_attention = Attention::new(
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            head_norm(vec![2.0; head_dim]),
+            head_norm(k_norm_weight),
+            hidden_dim,
+            2,
+            2,
+            head_dim,
+            10.0,
+        );
+        let scaled_output = scaled_attention.forward(&input, 2, 0, &mut scaled_cache);
+
+        assert!(scaled_output[hidden_dim] > base_output[hidden_dim] + 0.1);
+
+        let second_key_rms = ((3.0 * 3.0 + 1.0) / head_dim as f32 + 1e-6).sqrt();
+        let normalized_even = 3.0 / second_key_rms;
+        let normalized_odd = 2.0 / second_key_rms;
+        let expected_second_key_first_dim =
+            normalized_even * 1.0_f32.cos() - normalized_odd * 1.0_f32.sin();
+        let expected_second_key_second_dim =
+            normalized_even * 1.0_f32.sin() + normalized_odd * 1.0_f32.cos();
+        assert_close(
+            scaled_cache.keys()[hidden_dim],
+            expected_second_key_first_dim,
+        );
+        assert_close(
+            scaled_cache.keys()[hidden_dim + 1],
+            expected_second_key_second_dim,
+        );
     }
 }
