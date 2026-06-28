@@ -60,6 +60,7 @@ impl Model {
                 tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
                 tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
                 tensors.tensor_f32(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
+                config.hidden_size,
                 config.num_attention_heads,
                 config.num_key_value_heads,
                 config.head_dim,
