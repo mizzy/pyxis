@@ -3,6 +3,7 @@ pub struct Attention {
     wk: Vec<f32>,
     wv: Vec<f32>,
     wo: Vec<f32>,
+    hidden_dim: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -16,22 +17,25 @@ impl Attention {
         wk: Vec<f32>,
         wv: Vec<f32>,
         wo: Vec<f32>,
+        hidden_dim: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         rope_theta: f32,
     ) -> Self {
-        let hidden_dim = num_q_heads * head_dim;
-        assert_eq!(wq.len(), hidden_dim * num_q_heads * head_dim);
-        assert_eq!(wk.len(), hidden_dim * num_kv_heads * head_dim);
-        assert_eq!(wv.len(), hidden_dim * num_kv_heads * head_dim);
-        assert_eq!(wo.len(), num_q_heads * head_dim * hidden_dim);
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        assert_eq!(wq.len(), q_dim * hidden_dim);
+        assert_eq!(wk.len(), kv_dim * hidden_dim);
+        assert_eq!(wv.len(), kv_dim * hidden_dim);
+        assert_eq!(wo.len(), hidden_dim * q_dim);
 
         Self {
             wq,
             wk,
             wv,
             wo,
+            hidden_dim,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -40,25 +44,26 @@ impl Attention {
     }
 
     pub fn forward(&self, x: &[f32], seq_len: usize) -> Vec<f32> {
-        let hidden_dim = self.num_q_heads * self.head_dim;
+        let hidden_dim = self.hidden_dim;
+        let q_dim = self.num_q_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         assert_eq!(x.len(), seq_len * hidden_dim);
 
-        let mut queries = vec![0.0; seq_len * hidden_dim];
+        let mut queries = vec![0.0; seq_len * q_dim];
         let mut keys = vec![0.0; seq_len * kv_dim];
         let mut values = vec![0.0; seq_len * kv_dim];
 
         for pos in 0..seq_len {
             let input = &x[pos * hidden_dim..(pos + 1) * hidden_dim];
 
-            let mut query = matmul(input, &self.wq, hidden_dim, hidden_dim);
+            let mut query = matmul(input, &self.wq, q_dim, hidden_dim);
             let mut key = matmul(input, &self.wk, kv_dim, hidden_dim);
             let value = matmul(input, &self.wv, kv_dim, hidden_dim);
 
             apply_rope(&mut query, self.head_dim, pos, self.rope_theta);
             apply_rope(&mut key, self.head_dim, pos, self.rope_theta);
 
-            queries[pos * hidden_dim..(pos + 1) * hidden_dim].copy_from_slice(&query);
+            queries[pos * q_dim..(pos + 1) * q_dim].copy_from_slice(&query);
             keys[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&key);
             values[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&value);
         }
@@ -67,11 +72,11 @@ impl Attention {
         let scale = (self.head_dim as f32).sqrt();
 
         for pos in 0..seq_len {
-            let mut attention_output = vec![0.0; hidden_dim];
+            let mut attention_output = vec![0.0; q_dim];
 
             for q_head in 0..self.num_q_heads {
                 let kv_head = q_head * self.num_kv_heads / self.num_q_heads;
-                let q_start = pos * hidden_dim + q_head * self.head_dim;
+                let q_start = pos * q_dim + q_head * self.head_dim;
                 let mut scores = vec![f32::NEG_INFINITY; seq_len];
 
                 for (key_pos, score) in scores.iter_mut().enumerate().take(pos + 1) {
@@ -94,7 +99,7 @@ impl Attention {
                 }
             }
 
-            let projected = matmul(&attention_output, &self.wo, hidden_dim, hidden_dim);
+            let projected = matmul(&attention_output, &self.wo, hidden_dim, q_dim);
             output[pos * hidden_dim..(pos + 1) * hidden_dim].copy_from_slice(&projected);
         }
 
@@ -246,6 +251,7 @@ mod tests {
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
+            hidden_dim,
             2,
             2,
             4,
@@ -266,6 +272,7 @@ mod tests {
             vec![0.0; hidden_dim * hidden_dim],
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
+            hidden_dim,
             2,
             2,
             4,
@@ -285,6 +292,41 @@ mod tests {
     }
 
     #[test]
+    fn forward_with_hidden_dim_smaller_than_q_dim() {
+        let hidden_dim = 4;
+        let num_q_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mut wv = vec![0.0; kv_dim * hidden_dim];
+        let mut wo = vec![0.0; hidden_dim * q_dim];
+
+        for dim in 0..hidden_dim {
+            wv[dim * hidden_dim + dim] = 1.0;
+            wo[dim * q_dim + dim] = 1.0;
+        }
+
+        let attention = Attention::new(
+            vec![0.0; q_dim * hidden_dim],
+            vec![0.0; kv_dim * hidden_dim],
+            wv,
+            wo,
+            hidden_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            10.0,
+        );
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let output = attention.forward(&x, 2);
+
+        assert_eq!(output.len(), 2 * hidden_dim);
+        assert_vec_close(&output, &[1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
     fn forward_gqa_shares_kv_heads() {
         let hidden_dim = 16;
         let kv_dim = 8;
@@ -293,6 +335,7 @@ mod tests {
             vec![0.0; kv_dim * hidden_dim],
             vec![0.0; kv_dim * hidden_dim],
             vec![0.0; hidden_dim * hidden_dim],
+            hidden_dim,
             4,
             2,
             4,
