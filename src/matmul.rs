@@ -8,11 +8,53 @@ pub fn matmul(input: &[f32], weight: &[f32], out_features: usize, in_features: u
         .into_par_iter()
         .map(|out_idx| {
             let row_start = out_idx * in_features;
-            (0..in_features)
-                .map(|in_idx| input[in_idx] * weight[row_start + in_idx])
-                .sum()
+            dot_product(input, &weight[row_start..row_start + in_features])
         })
         .collect()
+}
+
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_product_neon(a, b)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_product_scalar(a, b)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    assert_eq!(a.len(), b.len());
+
+    let chunks = a.len() / 4;
+    let mut sum = unsafe { vdupq_n_f32(0.0) };
+
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let va = unsafe { vld1q_f32(a.as_ptr().add(offset)) };
+        let vb = unsafe { vld1q_f32(b.as_ptr().add(offset)) };
+        sum = unsafe { vfmaq_f32(sum, va, vb) };
+    }
+
+    let mut result = unsafe { vaddvq_f32(sum) };
+
+    for index in chunks * 4..a.len() {
+        result += a[index] * b[index];
+    }
+
+    result
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
 #[cfg(test)]
@@ -59,5 +101,35 @@ mod tests {
 
         assert_eq!(output.len(), 1000);
         assert!(output.iter().all(|value| *value == 100.0));
+    }
+
+    #[test]
+    fn dot_product_matches_scalar() {
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let weight = vec![2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let output = dot_product(&input, &weight);
+
+        assert_eq!(output, 70.0);
+    }
+
+    #[test]
+    fn dot_product_large_aligned() {
+        let input = vec![1.0; 1024];
+        let weight = vec![1.0; 1024];
+
+        let output = dot_product(&input, &weight);
+
+        assert_eq!(output, 1024.0);
+    }
+
+    #[test]
+    fn dot_product_with_remainder() {
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let weight = vec![7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+
+        let output = dot_product(&input, &weight);
+
+        assert_eq!(output, 84.0);
     }
 }
