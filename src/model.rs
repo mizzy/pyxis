@@ -8,6 +8,7 @@ use crate::safetensors::TensorStore;
 use crate::sampler::Sampler;
 use crate::tokenizer::PyxisTokenizer;
 use crate::transformer::{Transformer, TransformerBlock};
+use crate::weights::Weights;
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
@@ -111,13 +112,13 @@ impl Model {
             };
             let attention = Attention::new(
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
                 q_norm,
                 k_norm,
                 config.hidden_size,
@@ -134,10 +135,11 @@ impl Model {
             );
             let ffn = Ffn::new(
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.mlp.gate_proj.weight"))?,
-                tensor_store.tensor_f32(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.gate_proj.weight"))?,
                 tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.mlp.down_proj.weight"))?,
+                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
+                tensor_store
+                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.down_proj.weight"))?,
                 config.hidden_size,
                 config.intermediate_size,
             );
@@ -156,9 +158,9 @@ impl Model {
         );
         let transformer = Transformer::new(blocks, final_norm, config.hidden_size);
         let output_weight = if config.tie_word_embeddings {
-            embed_tokens_weight
+            Weights::F32(embed_tokens_weight)
         } else {
-            tensor_store.tensor_f32("lm_head.weight")?
+            tensor_store.tensor_weights("lm_head.weight")?
         };
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
         let sampler = Sampler::new(0.7, 0.9, 1.2);

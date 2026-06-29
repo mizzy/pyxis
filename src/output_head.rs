@@ -1,13 +1,14 @@
 use crate::matmul::matmul;
+use crate::weights::Weights;
 
 pub struct OutputHead {
-    weight: Vec<f32>,
+    weight: Weights,
     vocab_size: usize,
     hidden_dim: usize,
 }
 
 impl OutputHead {
-    pub fn new(weight: Vec<f32>, vocab_size: usize, hidden_dim: usize) -> Self {
+    pub fn new(weight: Weights, vocab_size: usize, hidden_dim: usize) -> Self {
         assert_eq!(weight.len(), vocab_size * hidden_dim);
 
         Self {
@@ -48,7 +49,11 @@ mod tests {
 
     #[test]
     fn logits_with_identity_weight() {
-        let output_head = OutputHead::new(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 3, 3);
+        let output_head = OutputHead::new(
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].into(),
+            3,
+            3,
+        );
 
         let logits = output_head.logits(&[1.0, 2.0, 3.0]);
 
@@ -57,7 +62,7 @@ mod tests {
 
     #[test]
     fn logits_returns_correct_length() {
-        let output_head = OutputHead::new(vec![0.0; 12], 4, 3);
+        let output_head = OutputHead::new(vec![0.0; 12].into(), 4, 3);
 
         let logits = output_head.logits(&[1.0, 2.0, 3.0]);
 
@@ -66,7 +71,7 @@ mod tests {
 
     #[test]
     fn greedy_returns_argmax_of_logits() {
-        let output_head = OutputHead::new(vec![1.0, 0.0, 3.0, 0.0, 2.0, 0.0], 3, 2);
+        let output_head = OutputHead::new(vec![1.0, 0.0, 3.0, 0.0, 2.0, 0.0].into(), 3, 2);
 
         let token_id = output_head.greedy(&[1.0, 1.0]);
 
@@ -86,6 +91,6 @@ mod tests {
     #[test]
     #[should_panic]
     fn new_panics_on_wrong_weight_length() {
-        OutputHead::new(vec![0.0; 10], 3, 4);
+        OutputHead::new(vec![0.0; 10].into(), 3, 4);
     }
 }

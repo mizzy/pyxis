@@ -1,3 +1,4 @@
+use crate::weights::Weights;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -90,6 +91,13 @@ impl ShardedSafeTensors {
         self.shards[*shard_index].tensor_f32(name)
     }
 
+    pub fn tensor_weights(&self, name: &str) -> io::Result<Weights> {
+        let shard_index = self.tensor_to_shard.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("tensor not found: {name}"))
+        })?;
+        self.shards[*shard_index].tensor_weights(name)
+    }
+
     pub fn has_tensor(&self, name: &str) -> bool {
         self.tensor_to_shard.contains_key(name)
     }
@@ -135,6 +143,13 @@ impl TensorStore {
         match self {
             Self::Single(safetensors) => safetensors.tensor_f32(name),
             Self::Sharded(safetensors) => safetensors.tensor_f32(name),
+        }
+    }
+
+    pub fn tensor_weights(&self, name: &str) -> io::Result<Weights> {
+        match self {
+            Self::Single(safetensors) => safetensors.tensor_weights(name),
+            Self::Sharded(safetensors) => safetensors.tensor_weights(name),
         }
     }
 
@@ -203,6 +218,26 @@ impl SafeTensors {
     }
 
     pub fn tensor_f32(&self, name: &str) -> io::Result<Vec<f32>> {
+        let (info, bytes) = self.tensor_data(name)?;
+
+        Ok(decode_f32(info.dtype, bytes))
+    }
+
+    pub fn tensor_weights(&self, name: &str) -> io::Result<Weights> {
+        let (info, bytes) = self.tensor_data(name)?;
+
+        match info.dtype {
+            Dtype::BF16 => Ok(Weights::Bf16(
+                bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect(),
+            )),
+            Dtype::F32 | Dtype::F16 => Ok(Weights::F32(decode_f32(info.dtype, bytes))),
+        }
+    }
+
+    fn tensor_data(&self, name: &str) -> io::Result<(&TensorInfo, &[u8])> {
         let info = self.tensors.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("tensor not found: {name}"))
         })?;
@@ -230,22 +265,7 @@ impl SafeTensors {
             ));
         }
 
-        let values = match info.dtype {
-            Dtype::F32 => bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            Dtype::F16 => bytes
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect(),
-            Dtype::BF16 => bytes
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect(),
-        };
-
-        Ok(values)
+        Ok((info, bytes))
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {
@@ -262,6 +282,23 @@ impl SafeTensors {
 
     pub fn tensors(&self) -> &HashMap<String, TensorInfo> {
         &self.tensors
+    }
+}
+
+fn decode_f32(dtype: Dtype, bytes: &[u8]) -> Vec<f32> {
+    match dtype {
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+        Dtype::F16 => bytes
+            .chunks_exact(2)
+            .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .collect(),
+        Dtype::BF16 => bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .collect(),
     }
 }
 
@@ -595,6 +632,34 @@ mod tests {
         for (actual, expected) in loaded.iter().zip(values) {
             assert!((actual - expected).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn tensor_weights_returns_bf16_for_bf16_dtype() {
+        let values = [1.5f32, -2.25, 3.5];
+        let raw_bf16: Vec<u16> = values
+            .iter()
+            .map(|value| half::bf16::from_f32(*value).to_bits())
+            .collect();
+        let data: Vec<u8> = raw_bf16
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let file = create_test_safetensors(
+            serde_json::json!({
+                "values": {
+                    "dtype": "BF16",
+                    "shape": [3],
+                    "data_offsets": [0, 6]
+                }
+            }),
+            &data,
+        );
+
+        let tensors = SafeTensors::load(file.path()).unwrap();
+        let weights = tensors.tensor_weights("values").unwrap();
+
+        assert!(matches!(weights, crate::weights::Weights::Bf16(values) if values == raw_bf16));
     }
 
     #[test]

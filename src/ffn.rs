@@ -1,18 +1,19 @@
 use crate::matmul::matmul;
+use crate::weights::Weights;
 
 pub struct Ffn {
-    gate_proj: Vec<f32>,
-    up_proj: Vec<f32>,
-    down_proj: Vec<f32>,
+    gate_proj: Weights,
+    up_proj: Weights,
+    down_proj: Weights,
     hidden_dim: usize,
     intermediate_size: usize,
 }
 
 impl Ffn {
     pub fn new(
-        gate_proj: Vec<f32>,
-        up_proj: Vec<f32>,
-        down_proj: Vec<f32>,
+        gate_proj: Weights,
+        up_proj: Weights,
+        down_proj: Weights,
         hidden_dim: usize,
         intermediate_size: usize,
     ) -> Self {
@@ -89,9 +90,9 @@ mod tests {
     #[test]
     fn forward_with_known_weights() {
         let ffn = Ffn::new(
-            vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            vec![2.0, 0.0, 0.0, -1.0, 0.5, 0.5],
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0].into(),
+            vec![2.0, 0.0, 0.0, -1.0, 0.5, 0.5].into(),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 1.0].into(),
             2,
             3,
         );
@@ -104,7 +105,13 @@ mod tests {
     #[test]
     #[should_panic]
     fn forward_panics_on_wrong_input_length() {
-        let ffn = Ffn::new(vec![0.0; 6], vec![0.0; 6], vec![0.0; 6], 2, 3);
+        let ffn = Ffn::new(
+            vec![0.0; 6].into(),
+            vec![0.0; 6].into(),
+            vec![0.0; 6].into(),
+            2,
+            3,
+        );
 
         ffn.forward(&[1.0, 2.0, 3.0]);
     }
