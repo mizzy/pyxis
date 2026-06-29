@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 const QWEN3_EOS_TOKEN_ID: u32 = 151_645;
+const INT4_BLOCK_SIZE: usize = 32;
 
 pub struct BenchmarkResult {
     pub load_time_ms: f64,
@@ -73,8 +74,15 @@ struct ModelConfig {
     tie_word_embeddings: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quantization {
+    Int8,
+    Int4,
+}
+
 impl Model {
-    pub fn load(model_path: &Path, quantize: bool) -> io::Result<Self> {
+    pub fn load(model_path: &Path, quantize: Option<&str>) -> io::Result<Self> {
+        let quantization = quantize.map(parse_quantization).transpose()?;
         let (tokenizer, config, tensor_store) = if is_gguf_path(model_path) {
             load_gguf_inputs(model_path)?
         } else {
@@ -84,12 +92,11 @@ impl Model {
                 TensorStore::load(model_path)?,
             )
         };
-        let maybe_quantize = |weights, out_features, in_features| {
-            if quantize {
-                quantize_weights(weights, out_features, in_features)
-            } else {
-                weights
+        let maybe_quantize = |weights, out_features, in_features| match quantization {
+            Some(quantization) => {
+                quantize_weights(weights, out_features, in_features, quantization)
             }
+            None => weights,
         };
 
         let embed_tokens_weight = tensor_store.tensor_f32("model.embed_tokens.weight")?;
@@ -449,6 +456,17 @@ fn is_gguf_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
+fn parse_quantization(value: &str) -> io::Result<Quantization> {
+    match value {
+        "int8" => Ok(Quantization::Int8),
+        "int4" => Ok(Quantization::Int4),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported quantization mode: {value}"),
+        )),
+    }
+}
+
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -461,17 +479,69 @@ fn tokens_per_second(tokens: usize, elapsed_ms: f64) -> f64 {
     }
 }
 
-fn quantize_weights(weights: Weights, out_features: usize, in_features: usize) -> Weights {
+fn quantize_weights(
+    weights: Weights,
+    out_features: usize,
+    in_features: usize,
+    quantization: Quantization,
+) -> Weights {
+    assert_eq!(weights.len(), out_features * in_features);
+
+    if matches!(
+        (&weights, quantization),
+        (Weights::Int8 { .. }, Quantization::Int8) | (Weights::Int4 { .. }, Quantization::Int4)
+    ) {
+        return weights;
+    }
+
+    let f32_values = dequantize_weights(weights);
+    quantize_f32_values(&f32_values, out_features, in_features, quantization)
+}
+
+fn quantize_f32_values(
+    values: &[f32],
+    out_features: usize,
+    in_features: usize,
+    quantization: Quantization,
+) -> Weights {
+    match quantization {
+        Quantization::Int8 => Weights::quantize_int8(values, out_features, in_features),
+        Quantization::Int4 => Weights::quantize_int4(values, INT4_BLOCK_SIZE),
+    }
+}
+
+fn dequantize_weights(weights: Weights) -> Vec<f32> {
     match weights {
-        Weights::F32(values) => Weights::quantize_int8(&values, out_features, in_features),
-        Weights::Bf16(values) => {
-            let f32_values: Vec<f32> = values
-                .into_iter()
-                .map(|value| f32::from_bits((value as u32) << 16))
-                .collect();
-            Weights::quantize_int8(&f32_values, out_features, in_features)
-        }
-        weights @ Weights::Int8 { .. } => weights,
+        Weights::F32(values) => values,
+        Weights::Bf16(values) => values
+            .into_iter()
+            .map(|value| f32::from_bits((value as u32) << 16))
+            .collect(),
+        Weights::Int8 {
+            data,
+            scales,
+            row_size,
+        } => data
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| value as f32 * scales[index / row_size])
+            .collect(),
+        Weights::Int4 {
+            data,
+            scales,
+            block_size,
+            num_elements,
+        } => (0..num_elements)
+            .map(|index| {
+                let byte = data[index / 2];
+                let nibble = if index.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    (byte >> 4) & 0x0f
+                };
+                (nibble as f32 - 8.0) * scales[index / block_size]
+            })
+            .collect(),
     }
 }
 
@@ -532,7 +602,12 @@ mod tests {
 
     #[test]
     fn quantize_weights_quantizes_f32_weights() {
-        let weights = quantize_weights(Weights::F32(vec![1.0, -2.0, 0.0, 4.0]), 2, 2);
+        let weights = quantize_weights(
+            Weights::F32(vec![1.0, -2.0, 0.0, 4.0]),
+            2,
+            2,
+            Quantization::Int8,
+        );
         let Weights::Int8 {
             data,
             scales,
@@ -555,7 +630,7 @@ mod tests {
             (1.5_f32.to_bits() >> 16) as u16,
             ((-2.0_f32).to_bits() >> 16) as u16,
         ];
-        let weights = quantize_weights(Weights::Bf16(bf16_values), 1, 2);
+        let weights = quantize_weights(Weights::Bf16(bf16_values), 1, 2, Quantization::Int8);
         let Weights::Int8 {
             data,
             scales,
@@ -568,5 +643,29 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert_eq!(scales, vec![2.0 / 127.0]);
         assert_eq!(row_size, 2);
+    }
+
+    #[test]
+    fn quantize_weights_quantizes_f32_weights_to_int4() {
+        let weights = quantize_weights(
+            Weights::F32(vec![7.0, -7.0, 0.0, 3.0]),
+            2,
+            2,
+            Quantization::Int4,
+        );
+        let Weights::Int4 {
+            data,
+            scales,
+            block_size,
+            num_elements,
+        } = weights
+        else {
+            panic!("expected int4 weights");
+        };
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(scales, vec![1.0]);
+        assert_eq!(block_size, INT4_BLOCK_SIZE);
+        assert_eq!(num_elements, 4);
     }
 }
