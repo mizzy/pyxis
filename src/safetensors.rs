@@ -1,3 +1,4 @@
+use crate::gguf::GgufFile;
 use crate::weights::Weights;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -107,10 +108,19 @@ impl ShardedSafeTensors {
 pub enum TensorStore {
     Single(SafeTensors),
     Sharded(ShardedSafeTensors),
+    Gguf(GgufFile),
 }
 
 impl TensorStore {
     pub fn load(model_dir: &Path) -> io::Result<Self> {
+        if model_dir
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            return Ok(Self::Gguf(GgufFile::parse(model_dir)?));
+        }
+
         let single_path = model_dir.join("model.safetensors");
         let index_path = model_dir.join("model.safetensors.index.json");
 
@@ -143,6 +153,7 @@ impl TensorStore {
         match self {
             Self::Single(safetensors) => safetensors.tensor_f32(name),
             Self::Sharded(safetensors) => safetensors.tensor_f32(name),
+            Self::Gguf(gguf) => gguf.tensor_f32_by_pyxis_name(name),
         }
     }
 
@@ -150,6 +161,7 @@ impl TensorStore {
         match self {
             Self::Single(safetensors) => safetensors.tensor_weights(name),
             Self::Sharded(safetensors) => safetensors.tensor_weights(name),
+            Self::Gguf(gguf) => gguf.tensor_weights_by_pyxis_name(name),
         }
     }
 
@@ -157,6 +169,7 @@ impl TensorStore {
         match self {
             Self::Single(safetensors) => safetensors.has_tensor(name),
             Self::Sharded(safetensors) => safetensors.has_tensor(name),
+            Self::Gguf(gguf) => gguf.has_tensor_by_pyxis_name(name),
         }
     }
 }
