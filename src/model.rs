@@ -123,7 +123,7 @@ impl Model {
             tensor_store.tensor_f32("lm_head.weight")?
         };
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
-        let sampler = Sampler::new(1.2);
+        let sampler = Sampler::new(0.7, 0.9, 1.2);
 
         Ok(Self {
             tokenizer,
