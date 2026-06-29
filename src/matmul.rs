@@ -9,6 +9,13 @@ pub fn matmul(
 ) -> Vec<f32> {
     assert_eq!(input.len(), in_features);
     assert_eq!(weight.len(), out_features * in_features);
+    if let Weights::Int8 {
+        scales, row_size, ..
+    } = weight
+    {
+        assert_eq!(*row_size, in_features);
+        assert_eq!(scales.len(), out_features);
+    }
 
     (0..out_features)
         .into_par_iter()
@@ -21,6 +28,11 @@ pub fn matmul(
                 Weights::Bf16(values) => {
                     dot_product_bf16(input, &values[row_start..row_start + in_features])
                 }
+                Weights::Int8 { data, scales, .. } => dot_product_int8(
+                    input,
+                    &data[row_start..row_start + in_features],
+                    scales[out_idx],
+                ),
             }
         })
         .collect()
@@ -51,6 +63,20 @@ fn dot_product_bf16(a: &[f32], b_bf16: &[u16]) -> f32 {
     #[cfg(not(target_arch = "aarch64"))]
     {
         dot_product_bf16_scalar(a, b_bf16)
+    }
+}
+
+fn dot_product_int8(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
+    assert_eq!(input.len(), quantized.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_product_int8_neon(input, quantized, scale)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_product_int8_scalar(input, quantized, scale)
     }
 }
 
@@ -108,6 +134,37 @@ fn dot_product_bf16_neon(a: &[f32], b_bf16: &[u16]) -> f32 {
     result
 }
 
+#[cfg(target_arch = "aarch64")]
+fn dot_product_int8_neon(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
+    use std::arch::aarch64::*;
+
+    assert_eq!(input.len(), quantized.len());
+
+    let chunks = input.len() / 4;
+    let mut sum = unsafe { vdupq_n_f32(0.0) };
+
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let va = unsafe { vld1q_f32(input.as_ptr().add(offset)) };
+        let quantized_f32 = [
+            quantized[offset] as f32,
+            quantized[offset + 1] as f32,
+            quantized[offset + 2] as f32,
+            quantized[offset + 3] as f32,
+        ];
+        let vb = unsafe { vld1q_f32(quantized_f32.as_ptr()) };
+        sum = unsafe { vfmaq_f32(sum, va, vb) };
+    }
+
+    let mut result = unsafe { vaddvq_f32(sum) };
+
+    for index in chunks * 4..input.len() {
+        result += input[index] * quantized[index] as f32;
+    }
+
+    result * scale
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
@@ -119,6 +176,16 @@ fn dot_product_bf16_scalar(a: &[f32], b_bf16: &[u16]) -> f32 {
         .zip(b_bf16)
         .map(|(a, b)| a * f32::from_bits((*b as u32) << 16))
         .sum()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn dot_product_int8_scalar(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
+    input
+        .iter()
+        .zip(quantized)
+        .map(|(input, quantized)| input * *quantized as f32)
+        .sum::<f32>()
+        * scale
 }
 
 #[cfg(test)]
@@ -220,6 +287,23 @@ mod tests {
     }
 
     #[test]
+    fn dot_product_int8_matches_f32() {
+        let input = vec![0.5, -2.0, 1.5, 4.0];
+        let weight = vec![1.0, -0.5, 2.0, -3.0];
+        let Weights::Int8 { data, scales, .. } = Weights::quantize_int8(&weight, 1, 4) else {
+            panic!("expected int8 weights");
+        };
+
+        let actual = dot_product_int8(&input, &data, scales[0]);
+        let expected = dot_product(&input, &weight);
+
+        assert!(
+            (actual - expected).abs() < 0.05,
+            "expected {actual} to be close to {expected}"
+        );
+    }
+
+    #[test]
     fn matmul_with_bf16_weights() {
         let input = vec![1.0, 2.0, -1.0];
         let weight_f32 = vec![1.5, -0.5, 2.0, 0.25, 3.0, -1.0];
@@ -232,5 +316,23 @@ mod tests {
         let expected = matmul(&input, &Weights::F32(weight_f32), 2, 3);
 
         assert_vec_close(&output, &expected);
+    }
+
+    #[test]
+    fn matmul_with_int8_weights() {
+        let input = vec![1.0, 2.0, -1.0];
+        let weight_f32 = vec![1.5, -0.5, 2.0, 0.25, 3.0, -1.0];
+        let weight_int8 = Weights::quantize_int8(&weight_f32, 2, 3);
+
+        let output = matmul(&input, &weight_int8, 2, 3);
+        let expected = matmul(&input, &Weights::F32(weight_f32), 2, 3);
+
+        assert_eq!(output.len(), expected.len());
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 0.05,
+                "expected {actual} to be close to {expected}"
+            );
+        }
     }
 }
