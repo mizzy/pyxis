@@ -73,10 +73,17 @@ struct ModelConfig {
 }
 
 impl Model {
-    pub fn load(model_dir: &Path) -> io::Result<Self> {
+    pub fn load(model_dir: &Path, quantize: bool) -> io::Result<Self> {
         let tokenizer = PyxisTokenizer::load(&model_dir.join("tokenizer.json"))?;
         let config = read_config(&model_dir.join("config.json"))?;
         let tensor_store = TensorStore::load(model_dir)?;
+        let maybe_quantize = |weights, out_features, in_features| {
+            if quantize {
+                quantize_weights(weights, out_features, in_features)
+            } else {
+                weights
+            }
+        };
 
         let embed_tokens_weight = tensor_store.tensor_f32("model.embed_tokens.weight")?;
         let embedding = Embedding::new(
@@ -110,15 +117,37 @@ impl Model {
             } else {
                 None
             };
+            let q_dim = config.num_attention_heads * config.head_dim;
+            let kv_dim = config.num_key_value_heads * config.head_dim;
             let attention = Attention::new(
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.k_proj.weight"))?,
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.v_proj.weight"))?,
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.self_attn.o_proj.weight"))?,
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.self_attn.q_proj.weight"
+                    ))?,
+                    q_dim,
+                    config.hidden_size,
+                ),
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.self_attn.k_proj.weight"
+                    ))?,
+                    kv_dim,
+                    config.hidden_size,
+                ),
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.self_attn.v_proj.weight"
+                    ))?,
+                    kv_dim,
+                    config.hidden_size,
+                ),
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.self_attn.o_proj.weight"
+                    ))?,
+                    config.hidden_size,
+                    q_dim,
+                ),
                 q_norm,
                 k_norm,
                 config.hidden_size,
@@ -134,12 +163,26 @@ impl Model {
                 config.rms_norm_eps,
             );
             let ffn = Ffn::new(
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.gate_proj.weight"))?,
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
-                tensor_store
-                    .tensor_weights(&format!("model.layers.{layer_idx}.mlp.down_proj.weight"))?,
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.mlp.gate_proj.weight"
+                    ))?,
+                    config.intermediate_size,
+                    config.hidden_size,
+                ),
+                maybe_quantize(
+                    tensor_store
+                        .tensor_weights(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
+                    config.intermediate_size,
+                    config.hidden_size,
+                ),
+                maybe_quantize(
+                    tensor_store.tensor_weights(&format!(
+                        "model.layers.{layer_idx}.mlp.down_proj.weight"
+                    ))?,
+                    config.hidden_size,
+                    config.intermediate_size,
+                ),
                 config.hidden_size,
                 config.intermediate_size,
             );
@@ -162,6 +205,7 @@ impl Model {
         } else {
             tensor_store.tensor_weights("lm_head.weight")?
         };
+        let output_weight = maybe_quantize(output_weight, config.vocab_size, config.hidden_size);
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
         let sampler = Sampler::new(0.7, 0.9, 1.2);
 
@@ -307,6 +351,20 @@ fn tokens_per_second(tokens: usize, elapsed_ms: f64) -> f64 {
     }
 }
 
+fn quantize_weights(weights: Weights, out_features: usize, in_features: usize) -> Weights {
+    match weights {
+        Weights::F32(values) => Weights::quantize_int8(&values, out_features, in_features),
+        Weights::Bf16(values) => {
+            let f32_values: Vec<f32> = values
+                .into_iter()
+                .map(|value| f32::from_bits((value as u32) << 16))
+                .collect();
+            Weights::quantize_int8(&f32_values, out_features, in_features)
+        }
+        weights @ Weights::Int8 { .. } => weights,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +418,45 @@ mod tests {
         assert_eq!(result.decode_tokens, 7);
         assert_eq!(result.decode_time_ms, 30.0);
         assert_eq!(result.decode_tokens_per_sec, 233.33);
+    }
+
+    #[test]
+    fn quantize_weights_quantizes_f32_weights() {
+        let weights = quantize_weights(Weights::F32(vec![1.0, -2.0, 0.0, 4.0]), 2, 2);
+        let Weights::Int8 {
+            data,
+            scales,
+            row_size,
+        } = weights
+        else {
+            panic!("expected int8 weights");
+        };
+
+        assert_eq!(data.len(), 4);
+        assert_eq!(scales.len(), 2);
+        assert_eq!(row_size, 2);
+        assert!((scales[0] - 2.0 / 127.0).abs() < f32::EPSILON);
+        assert!((scales[1] - 4.0 / 127.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn quantize_weights_quantizes_bf16_weights() {
+        let bf16_values = vec![
+            (1.5_f32.to_bits() >> 16) as u16,
+            ((-2.0_f32).to_bits() >> 16) as u16,
+        ];
+        let weights = quantize_weights(Weights::Bf16(bf16_values), 1, 2);
+        let Weights::Int8 {
+            data,
+            scales,
+            row_size,
+        } = weights
+        else {
+            panic!("expected int8 weights");
+        };
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(scales, vec![2.0 / 127.0]);
+        assert_eq!(row_size, 2);
     }
 }
