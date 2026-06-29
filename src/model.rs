@@ -1,6 +1,7 @@
 use crate::attention::Attention;
 use crate::embedding::Embedding;
 use crate::ffn::Ffn;
+use crate::gguf::GgufFile;
 use crate::kv_cache::KvCache;
 use crate::output_head::OutputHead;
 use crate::rmsnorm::RmsNorm;
@@ -73,10 +74,16 @@ struct ModelConfig {
 }
 
 impl Model {
-    pub fn load(model_dir: &Path, quantize: bool) -> io::Result<Self> {
-        let tokenizer = PyxisTokenizer::load(&model_dir.join("tokenizer.json"))?;
-        let config = read_config(&model_dir.join("config.json"))?;
-        let tensor_store = TensorStore::load(model_dir)?;
+    pub fn load(model_path: &Path, quantize: bool) -> io::Result<Self> {
+        let (tokenizer, config, tensor_store) = if is_gguf_path(model_path) {
+            load_gguf_inputs(model_path)?
+        } else {
+            (
+                PyxisTokenizer::load(&model_path.join("tokenizer.json"))?,
+                read_config(&model_path.join("config.json"))?,
+                TensorStore::load(model_path)?,
+            )
+        };
         let maybe_quantize = |weights, out_features, in_features| {
             if quantize {
                 quantize_weights(weights, out_features, in_features)
@@ -337,6 +344,109 @@ impl Model {
 fn read_config(path: &Path) -> io::Result<ModelConfig> {
     let json = fs::read_to_string(path)?;
     serde_json::from_str(&json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn load_gguf_inputs(path: &Path) -> io::Result<(PyxisTokenizer, ModelConfig, TensorStore)> {
+    let gguf = GgufFile::parse(path)?;
+    let config = config_from_gguf(&gguf)?;
+    let tokenizer_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tokenizer.json");
+
+    if !tokenizer_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "tokenizer.json not found next to GGUF file: {}. GGUF tokenizer extraction is not supported yet",
+                tokenizer_path.display()
+            ),
+        ));
+    }
+
+    let tokenizer = PyxisTokenizer::load(&tokenizer_path)?;
+    Ok((tokenizer, config, TensorStore::Gguf(gguf)))
+}
+
+fn config_from_gguf(gguf: &GgufFile) -> io::Result<ModelConfig> {
+    let arch = gguf.get_str("general.architecture").unwrap_or("llama");
+    let hidden_size = gguf_required_u32(gguf, arch, "embedding_length")? as usize;
+    let num_hidden_layers = gguf_required_u32(gguf, arch, "block_count")? as usize;
+    let num_attention_heads = gguf_required_u32(gguf, arch, "attention.head_count")? as usize;
+    let num_key_value_heads = gguf_required_u32(gguf, arch, "attention.head_count_kv")? as usize;
+    let intermediate_size = gguf_required_u32(gguf, arch, "feed_forward_length")? as usize;
+    let rms_norm_eps = gguf_required_f32(gguf, arch, "attention.layer_norm_rms_epsilon")?;
+    let rope_theta = gguf_required_f32(gguf, arch, "rope.freq_base")?;
+
+    if num_attention_heads == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF attention head count must be greater than zero",
+        ));
+    }
+
+    let head_dim = gguf
+        .get_u32(&format!("{arch}.attention.key_length"))
+        .map(|value| value as usize)
+        .unwrap_or(hidden_size / num_attention_heads);
+
+    let token_embd = gguf.tensor_info("token_embd.weight").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF token_embd.weight tensor is required to infer vocab size",
+        )
+    })?;
+    let vocab_size = token_embd.dims.get(1).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF token_embd.weight must have at least two dimensions",
+        )
+    })?;
+    let vocab_size = usize::try_from(vocab_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF vocab size does not fit in usize",
+        )
+    })?;
+
+    Ok(ModelConfig {
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        intermediate_size,
+        rms_norm_eps,
+        rope_theta,
+        vocab_size,
+        tie_word_embeddings: gguf.tensor_info("output.weight").is_none(),
+    })
+}
+
+fn gguf_required_u32(gguf: &GgufFile, arch: &str, suffix: &str) -> io::Result<u32> {
+    let key = format!("{arch}.{suffix}");
+    gguf.get_u32(&key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing GGUF key: {key}"),
+        )
+    })
+}
+
+fn gguf_required_f32(gguf: &GgufFile, arch: &str, suffix: &str) -> io::Result<f32> {
+    let key = format!("{arch}.{suffix}");
+    gguf.get_f32(&key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing GGUF key: {key}"),
+        )
+    })
+}
+
+fn is_gguf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
