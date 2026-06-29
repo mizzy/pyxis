@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, PartialEq)]
+#[cfg(target_os = "macos")]
+use metal::Buffer;
+
+#[derive(Debug, Clone)]
 pub enum Weights {
     F32(Vec<f32>),
     Bf16(Vec<u16>),
@@ -13,6 +16,11 @@ pub enum Weights {
         block_size: usize,
         num_elements: usize,
     },
+    #[cfg(target_os = "macos")]
+    MetalF32 {
+        buffer: Buffer,
+        len: usize,
+    },
 }
 
 impl Weights {
@@ -22,6 +30,8 @@ impl Weights {
             Self::Bf16(values) => values.len(),
             Self::Int8 { data, .. } => data.len(),
             Self::Int4 { num_elements, .. } => *num_elements,
+            #[cfg(target_os = "macos")]
+            Self::MetalF32 { len, .. } => *len,
         }
     }
 
@@ -35,6 +45,35 @@ impl Weights {
             Self::Bf16(_) => panic!("cannot get f32 slice from bf16 weights"),
             Self::Int8 { .. } => panic!("cannot get f32 slice from int8 weights"),
             Self::Int4 { .. } => panic!("cannot get f32 slice from int4 weights"),
+            #[cfg(target_os = "macos")]
+            Self::MetalF32 { .. } => panic!("cannot get f32 slice from MetalF32 weights"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn to_metal(&self, metal: &crate::metal_matmul::MetalMatmul) -> Self {
+        match self {
+            Self::F32(data) => {
+                let buffer = metal.create_buffer(data);
+                Self::MetalF32 {
+                    buffer,
+                    len: data.len(),
+                }
+            }
+            Self::Bf16(data) => {
+                let f32_data: Vec<f32> = data
+                    .iter()
+                    .map(|&value| f32::from_bits((value as u32) << 16))
+                    .collect();
+                let buffer = metal.create_buffer(&f32_data);
+                Self::MetalF32 {
+                    buffer,
+                    len: f32_data.len(),
+                }
+            }
+            Self::Int8 { .. } | Self::Int4 { .. } | Self::MetalF32 { .. } => {
+                panic!("to_metal only supports F32 and Bf16 weights")
+            }
         }
     }
 
