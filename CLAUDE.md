@@ -25,12 +25,18 @@ Input text
   → Repeat (with KV cache)
 ```
 
+Matmul dispatch: rayon parallel → NEON SIMD dot product (CPU),
+or Metal compute shader with persistent GPU buffers.
+
 ## Key Design Decisions
 
-- **CPU-first**: No GPU/Metal code initially. Raw slice operations
-  or `ndarray` for tensor math.
-- **Safetensors format**: Model weights are loaded from HuggingFace
-  safetensors files (JSON header + raw byte arrays).
+- **CPU + Metal GPU**: CPU path with rayon multi-threaded matmul
+  and NEON SIMD dot product. Metal GPU compute shader for matmul
+  with persistent GPU buffers for weights.
+- **Quantization**: Supports BF16, int8, and int4 weight
+  quantization (self-quantized at load time).
+- **Safetensors + GGUF formats**: Model weights can be loaded from
+  HuggingFace safetensors files or GGUF format.
 - **Tokenizer**: Uses the `tokenizers` crate (HuggingFace) for BPE.
   Not reimplemented — the transformer itself is where the learning
   value is.
@@ -53,7 +59,8 @@ vocabulary). The model files are:
 ```
 config.json            # architecture (num_layers, hidden_size, etc.)
 tokenizer.json         # BPE vocabulary and merge rules
-model.safetensors      # weights (~1GB quantized Q4, ~6.8GB fp32)
+model.safetensors      # weights (safetensors format)
+model.gguf             # weights (GGUF format, alternative)
 ```
 
 ## Safetensors Key Names (Qwen3-1.7B)
