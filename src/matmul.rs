@@ -16,6 +16,17 @@ pub fn matmul(
         assert_eq!(*row_size, in_features);
         assert_eq!(scales.len(), out_features);
     }
+    if let Weights::Int4 {
+        data,
+        scales,
+        block_size,
+        num_elements,
+    } = weight
+    {
+        assert!(*block_size > 0);
+        assert_eq!(data.len(), num_elements.div_ceil(2));
+        assert_eq!(scales.len(), num_elements.div_ceil(*block_size));
+    }
 
     (0..out_features)
         .into_par_iter()
@@ -33,6 +44,12 @@ pub fn matmul(
                     &data[row_start..row_start + in_features],
                     scales[out_idx],
                 ),
+                Weights::Int4 {
+                    data,
+                    scales,
+                    block_size,
+                    ..
+                } => dot_product_int4(input, data, scales, *block_size, row_start, in_features),
             }
         })
         .collect()
@@ -78,6 +95,32 @@ fn dot_product_int8(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
     {
         dot_product_int8_scalar(input, quantized, scale)
     }
+}
+
+fn dot_product_int4(
+    input: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    block_size: usize,
+    offset: usize,
+    len: usize,
+) -> f32 {
+    assert_eq!(input.len(), len);
+
+    let mut sum = 0.0;
+    for (index, input_value) in input.iter().enumerate() {
+        let global_idx = offset + index;
+        let byte = packed[global_idx / 2];
+        let nibble = if global_idx.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            (byte >> 4) & 0x0f
+        };
+        let scale = scales[global_idx / block_size];
+        sum += *input_value * (nibble as f32 - 8.0) * scale;
+    }
+
+    sum
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -331,6 +374,24 @@ mod tests {
         for (actual, expected) in output.iter().zip(expected) {
             assert!(
                 (*actual - expected).abs() < 0.05,
+                "expected {actual} to be close to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_with_int4_weights() {
+        let input = vec![1.0, 2.0, -1.0];
+        let weight_f32 = vec![1.5, -0.5, 2.0, 0.25, 3.0, -1.0];
+        let weight_int4 = Weights::quantize_int4(&weight_f32, 4);
+
+        let output = matmul(&input, &weight_int4, 2, 3);
+        let expected = matmul(&input, &Weights::F32(weight_f32), 2, 3);
+
+        assert_eq!(output.len(), expected.len());
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 0.5,
                 "expected {actual} to be close to {expected}"
             );
         }
