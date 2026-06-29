@@ -121,8 +121,8 @@ mod tests {
         RmsNorm::new(vec![1.0; HIDDEN_DIM], EPS)
     }
 
-    fn attention_norm() -> RmsNorm {
-        RmsNorm::new(vec![1.0; HEAD_DIM], EPS)
+    fn attention_norm() -> Option<RmsNorm> {
+        Some(RmsNorm::new(vec![1.0; HEAD_DIM], EPS))
     }
 
     fn zero_attention() -> Attention {
