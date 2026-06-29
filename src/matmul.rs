@@ -53,14 +53,6 @@ pub fn matmul(
         panic!("MetalF32 weights require Metal device");
     }
 
-    #[cfg(target_os = "macos")]
-    if let Weights::F32(values) = weight
-        && values.len() > 4096
-        && let Some(metal) = get_metal()
-    {
-        return metal.matmul(input, values, out_features, in_features);
-    }
-
     (0..out_features)
         .into_par_iter()
         .map(|out_idx| {
