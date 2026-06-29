@@ -13,14 +13,39 @@ fn metal_matmul_or_skip() -> Option<MetalMatmul> {
 }
 
 fn assert_vec_close(actual: &[f32], expected: &[f32]) {
+    assert_vec_close_with_tolerance(actual, expected, 1e-4);
+}
+
+fn assert_vec_close_with_tolerance(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
 
     for (actual, expected) in actual.iter().zip(expected) {
         assert!(
-            (*actual - *expected).abs() < 1e-4,
+            (*actual - *expected).abs() < tolerance,
             "expected {actual} to be close to {expected}"
         );
     }
+}
+
+fn cpu_matmul_f32(
+    input: &[f32],
+    weight: &[f32],
+    out_features: usize,
+    in_features: usize,
+) -> Vec<f32> {
+    assert_eq!(input.len(), in_features);
+    assert_eq!(weight.len(), out_features * in_features);
+
+    (0..out_features)
+        .map(|row| {
+            let row_start = row * in_features;
+            input
+                .iter()
+                .zip(&weight[row_start..row_start + in_features])
+                .map(|(input, weight)| *input * *weight)
+                .sum()
+        })
+        .collect()
 }
 
 #[test]
@@ -81,6 +106,46 @@ fn metal_matmul_matches_cpu() {
     let expected = matmul(&input, &Weights::F32(weight), out_features, in_features);
 
     assert_vec_close(&actual, &expected);
+}
+
+#[test]
+fn metal_matmul_matches_cpu_transformer_dimensions() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 2048;
+    let in_features = 2048;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 31.0) / 17.0 - 0.9)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 29 + 7) % 37) as f32 / 19.0 - 0.95)
+        .collect();
+
+    let actual = metal.matmul(&input, &weight, out_features, in_features);
+    let expected = cpu_matmul_f32(&input, &weight, out_features, in_features);
+
+    assert_vec_close_with_tolerance(&actual, &expected, 1e-2);
+}
+
+#[test]
+fn metal_matmul_multi_tile() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 64;
+    let in_features = 5504;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 43.0) / 23.0 - 0.85)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 31 + 13) % 47) as f32 / 29.0 - 0.8)
+        .collect();
+
+    let actual = metal.matmul(&input, &weight, out_features, in_features);
+    let expected = cpu_matmul_f32(&input, &weight, out_features, in_features);
+
+    assert_vec_close_with_tolerance(&actual, &expected, 1e-2);
 }
 
 #[test]

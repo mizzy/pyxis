@@ -2,9 +2,24 @@ use metal::*;
 use std::ffi::c_void;
 use std::mem;
 
-const SHADER_SOURCE: &str = r#"
+const THREADS_PER_ROW: u64 = 256;
+const INPUT_TILE_ELEMENTS: u64 = 4096;
+
+fn shader_source() -> String {
+    format!(
+        r#"
 #include <metal_stdlib>
 using namespace metal;
+
+constant uint THREADS_PER_ROW = {threads_per_row};
+constant uint SIMD_WIDTH = 32;
+constant uint INPUT_TILE_ELEMENTS = {input_tile_elements};
+constant uint SIMD_GROUPS_PER_ROW = THREADS_PER_ROW / SIMD_WIDTH;
+
+static inline float4 load_float4(device const float* values, uint offset) {{
+    packed_float4 packed = *(reinterpret_cast<device const packed_float4*>(values + offset));
+    return float4(packed);
+}}
 
 kernel void matmul_f32(
     device const float* input [[buffer(0)]],
@@ -12,18 +27,80 @@ kernel void matmul_f32(
     device float* output [[buffer(2)]],
     constant uint& in_features [[buffer(3)]],
     constant uint& out_features [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= out_features) return;
+    threadgroup float* shared_input [[threadgroup(0)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{{
+    uint row = gid.y;
+    if (row >= out_features) return;
+
+    uint local_id = tid.x;
+    uint row_start = row * in_features;
+    threadgroup float partial_sums[SIMD_GROUPS_PER_ROW];
 
     float sum = 0.0;
-    uint row_start = gid * in_features;
-    for (uint j = 0; j < in_features; j++) {
-        sum += input[j] * weight[row_start + j];
-    }
-    output[gid] = sum;
+
+    for (uint tile_base = 0; tile_base < in_features; tile_base += INPUT_TILE_ELEMENTS) {{
+        uint tile_len = min(INPUT_TILE_ELEMENTS, in_features - tile_base);
+        uint vec4_count = tile_len / 4;
+
+        for (uint vec4_index = local_id; vec4_index < vec4_count; vec4_index += THREADS_PER_ROW) {{
+            uint offset = vec4_index * 4;
+            float4 input_vec = load_float4(input + tile_base, offset);
+            shared_input[offset] = input_vec.x;
+            shared_input[offset + 1] = input_vec.y;
+            shared_input[offset + 2] = input_vec.z;
+            shared_input[offset + 3] = input_vec.w;
+        }}
+
+        for (uint offset = vec4_count * 4 + local_id; offset < tile_len; offset += THREADS_PER_ROW) {{
+            shared_input[offset] = input[tile_base + offset];
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint row_tile_start = row_start + tile_base;
+        for (uint vec4_index = local_id; vec4_index < vec4_count; vec4_index += THREADS_PER_ROW) {{
+            uint offset = vec4_index * 4;
+            float4 input_vec = float4(
+                shared_input[offset],
+                shared_input[offset + 1],
+                shared_input[offset + 2],
+                shared_input[offset + 3]
+            );
+            float4 weight_vec = load_float4(weight + row_tile_start, offset);
+            sum += dot(input_vec, weight_vec);
+        }}
+
+        for (uint offset = vec4_count * 4 + local_id; offset < tile_len; offset += THREADS_PER_ROW) {{
+            sum += shared_input[offset] * weight[row_tile_start + offset];
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    sum = simd_sum(sum);
+
+    if (simd_lane == 0) {{
+        partial_sums[simd_group] = sum;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (local_id == 0) {{
+        float total = 0.0;
+        for (uint i = 0; i < SIMD_GROUPS_PER_ROW; i++) {{
+            total += partial_sums[i];
+        }}
+        output[row] = total;
+    }}
+}}
+"#,
+        threads_per_row = THREADS_PER_ROW,
+        input_tile_elements = INPUT_TILE_ELEMENTS,
+    )
 }
-"#;
 
 pub struct MetalMatmul {
     device: Device,
@@ -35,8 +112,9 @@ impl MetalMatmul {
     pub fn new() -> Option<Self> {
         let device = Device::system_default()?;
         let command_queue = device.new_command_queue();
+        let shader_source = shader_source();
         let library = device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+            .new_library_with_source(&shader_source, &CompileOptions::new())
             .ok()?;
         let function = library.get_function("matmul_f32", None).ok()?;
         let pipeline = device
@@ -125,15 +203,15 @@ impl MetalMatmul {
             mem::size_of::<u32>() as u64,
             &out_features_u32 as *const u32 as *const c_void,
         );
+        encoder
+            .set_threadgroup_memory_length(0, INPUT_TILE_ELEMENTS * mem::size_of::<f32>() as u64);
 
-        let grid_size = MTLSize::new(out_features as u64, 1, 1);
-        let threadgroup_size = MTLSize::new(
-            self.pipeline
-                .max_total_threads_per_threadgroup()
-                .min(out_features as u64),
-            1,
-            1,
+        assert!(
+            self.pipeline.max_total_threads_per_threadgroup() >= THREADS_PER_ROW,
+            "Metal device does not support {THREADS_PER_ROW} threads per threadgroup"
         );
+        let grid_size = MTLSize::new(THREADS_PER_ROW, out_features as u64, 1);
+        let threadgroup_size = MTLSize::new(THREADS_PER_ROW, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
 
