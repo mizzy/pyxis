@@ -11,3 +11,4 @@ pub mod safetensors;
 pub mod sampler;
 pub mod tokenizer;
 pub mod transformer;
+pub mod weights;

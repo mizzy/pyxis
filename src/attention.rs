@@ -1,12 +1,13 @@
 use crate::kv_cache::LayerCache;
 use crate::matmul::matmul;
 use crate::rmsnorm::RmsNorm;
+use crate::weights::Weights;
 
 pub struct Attention {
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
+    wq: Weights,
+    wk: Weights,
+    wv: Weights,
+    wo: Weights,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     hidden_dim: usize,
@@ -19,10 +20,10 @@ pub struct Attention {
 impl Attention {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        wq: Vec<f32>,
-        wk: Vec<f32>,
-        wv: Vec<f32>,
-        wo: Vec<f32>,
+        wq: Weights,
+        wk: Weights,
+        wv: Weights,
+        wo: Weights,
         q_norm: Option<RmsNorm>,
         k_norm: Option<RmsNorm>,
         hidden_dim: usize,
@@ -198,12 +199,12 @@ mod tests {
         }
     }
 
-    fn identity_weight(size: usize) -> Vec<f32> {
+    fn identity_weight(size: usize) -> Weights {
         let mut weight = vec![0.0; size * size];
         for i in 0..size {
             weight[i * size + i] = 1.0;
         }
-        weight
+        Weights::F32(weight)
     }
 
     fn head_norm(weight: Vec<f32>) -> RmsNorm {
@@ -287,8 +288,8 @@ mod tests {
     fn forward_causal_mask() {
         let hidden_dim = 8;
         let attention = Attention::new(
-            vec![0.0; hidden_dim * hidden_dim],
-            vec![0.0; hidden_dim * hidden_dim],
+            vec![0.0; hidden_dim * hidden_dim].into(),
+            vec![0.0; hidden_dim * hidden_dim].into(),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             unit_head_norm(4),
@@ -330,10 +331,10 @@ mod tests {
         }
 
         let attention = Attention::new(
-            vec![0.0; q_dim * hidden_dim],
-            vec![0.0; kv_dim * hidden_dim],
-            wv,
-            wo,
+            vec![0.0; q_dim * hidden_dim].into(),
+            vec![0.0; kv_dim * hidden_dim].into(),
+            wv.into(),
+            wo.into(),
             unit_head_norm(head_dim),
             unit_head_norm(head_dim),
             hidden_dim,
@@ -356,10 +357,10 @@ mod tests {
         let hidden_dim = 16;
         let kv_dim = 8;
         let attention = Attention::new(
-            vec![0.0; hidden_dim * hidden_dim],
-            vec![0.0; kv_dim * hidden_dim],
-            vec![0.0; kv_dim * hidden_dim],
-            vec![0.0; hidden_dim * hidden_dim],
+            vec![0.0; hidden_dim * hidden_dim].into(),
+            vec![0.0; kv_dim * hidden_dim].into(),
+            vec![0.0; kv_dim * hidden_dim].into(),
+            vec![0.0; hidden_dim * hidden_dim].into(),
             unit_head_norm(4),
             unit_head_norm(4),
             hidden_dim,

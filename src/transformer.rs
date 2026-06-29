@@ -94,6 +94,7 @@ impl Transformer {
 mod tests {
     use super::*;
     use crate::kv_cache::{KvCache, LayerCache};
+    use crate::weights::Weights;
 
     const HIDDEN_DIM: usize = 4;
     const NUM_Q_HEADS: usize = 2;
@@ -127,10 +128,10 @@ mod tests {
 
     fn zero_attention() -> Attention {
         Attention::new(
-            vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
-            vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
-            vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
-            vec![0.0; HIDDEN_DIM * HIDDEN_DIM],
+            vec![0.0; HIDDEN_DIM * HIDDEN_DIM].into(),
+            vec![0.0; HIDDEN_DIM * HIDDEN_DIM].into(),
+            vec![0.0; HIDDEN_DIM * HIDDEN_DIM].into(),
+            vec![0.0; HIDDEN_DIM * HIDDEN_DIM].into(),
             attention_norm(),
             attention_norm(),
             HIDDEN_DIM,
@@ -159,9 +160,9 @@ mod tests {
 
     fn zero_ffn() -> Ffn {
         Ffn::new(
-            vec![0.0; INTERMEDIATE_SIZE * HIDDEN_DIM],
-            vec![0.0; INTERMEDIATE_SIZE * HIDDEN_DIM],
-            vec![0.0; HIDDEN_DIM * INTERMEDIATE_SIZE],
+            vec![0.0; INTERMEDIATE_SIZE * HIDDEN_DIM].into(),
+            vec![0.0; INTERMEDIATE_SIZE * HIDDEN_DIM].into(),
+            vec![0.0; HIDDEN_DIM * INTERMEDIATE_SIZE].into(),
             HIDDEN_DIM,
             INTERMEDIATE_SIZE,
         )
@@ -171,12 +172,12 @@ mod tests {
         TransformerBlock::new(norm(), zero_attention(), norm(), zero_ffn())
     }
 
-    fn identity_weight(size: usize) -> Vec<f32> {
+    fn identity_weight(size: usize) -> Weights {
         let mut weight = vec![0.0; size * size];
         for i in 0..size {
             weight[i * size + i] = 1.0;
         }
-        weight
+        Weights::F32(weight)
     }
 
     fn rms_norm_values(x: &[f32]) -> Vec<f32> {
