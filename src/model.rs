@@ -12,8 +12,38 @@ use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::Instant;
 
 const QWEN3_EOS_TOKEN_ID: u32 = 151_645;
+
+pub struct BenchmarkResult {
+    pub load_time_ms: f64,
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens: usize,
+    pub decode_time_ms: f64,
+    pub decode_tokens_per_sec: f64,
+}
+
+impl BenchmarkResult {
+    pub fn display(&self) {
+        eprintln!("=== Pyxis Benchmark ===");
+        eprintln!("Model load:  {:.0} ms", self.load_time_ms);
+        eprintln!(
+            "Prefill:     {} tokens in {:.0} ms ({:.2} tokens/s)",
+            self.prefill_tokens, self.prefill_time_ms, self.prefill_tokens_per_sec
+        );
+        eprintln!(
+            "Decode:      {} tokens in {:.0} ms ({:.2} tokens/s)",
+            self.decode_tokens, self.decode_time_ms, self.decode_tokens_per_sec
+        );
+        eprintln!(
+            "Total:       {:.0} ms",
+            self.load_time_ms + self.prefill_time_ms + self.decode_time_ms
+        );
+    }
+}
 
 pub struct Model {
     tokenizer: PyxisTokenizer,
@@ -191,11 +221,88 @@ impl Model {
 
         self.tokenizer.decode(&generated_token_ids)
     }
+
+    pub fn benchmark(&self, prompt: &str, max_tokens: usize) -> BenchmarkResult {
+        let mut token_ids = self.tokenizer.encode(prompt);
+        if token_ids.is_empty() {
+            return BenchmarkResult {
+                load_time_ms: 0.0,
+                prefill_tokens: 0,
+                prefill_time_ms: 0.0,
+                prefill_tokens_per_sec: 0.0,
+                decode_tokens: 0,
+                decode_time_ms: 0.0,
+                decode_tokens_per_sec: 0.0,
+            };
+        }
+
+        let mut kv_cache = self.new_kv_cache();
+        let seq_len = token_ids.len();
+
+        let prefill_start = Instant::now();
+        let mut x = Vec::with_capacity(seq_len * self.hidden_dim);
+        for token_id in &token_ids {
+            x.extend_from_slice(self.embedding.lookup(*token_id as usize));
+        }
+        self.transformer.forward(&mut x, seq_len, 0, &mut kv_cache);
+        let prefill_time_ms = elapsed_ms(prefill_start);
+
+        let mut decode_tokens = 0;
+        let mut decode_time_ms = 0.0;
+
+        if max_tokens > 0 {
+            let decode_start = Instant::now();
+            let last_start = (seq_len - 1) * self.hidden_dim;
+            let last_hidden = &x[last_start..last_start + self.hidden_dim];
+            let mut logits = self.output_head.logits(last_hidden);
+            let mut next_token_id = self.sampler.sample(&mut logits, &token_ids) as u32;
+
+            for _ in 0..max_tokens {
+                if next_token_id == self.eos_token_id {
+                    break;
+                }
+
+                decode_tokens += 1;
+                token_ids.push(next_token_id);
+
+                let mut x = self.embedding.lookup(next_token_id as usize).to_vec();
+                let start_pos = token_ids.len() - 1;
+                self.transformer
+                    .forward(&mut x, 1, start_pos, &mut kv_cache);
+                let mut logits = self.output_head.logits(&x);
+                next_token_id = self.sampler.sample(&mut logits, &token_ids) as u32;
+            }
+
+            decode_time_ms = elapsed_ms(decode_start);
+        }
+
+        BenchmarkResult {
+            load_time_ms: 0.0,
+            prefill_tokens: seq_len,
+            prefill_time_ms,
+            prefill_tokens_per_sec: tokens_per_second(seq_len, prefill_time_ms),
+            decode_tokens,
+            decode_time_ms,
+            decode_tokens_per_sec: tokens_per_second(decode_tokens, decode_time_ms),
+        }
+    }
 }
 
 fn read_config(path: &Path) -> io::Result<ModelConfig> {
     let json = fs::read_to_string(path)?;
     serde_json::from_str(&json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn tokens_per_second(tokens: usize, elapsed_ms: f64) -> f64 {
+    if elapsed_ms == 0.0 {
+        0.0
+    } else {
+        tokens as f64 / (elapsed_ms / 1000.0)
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +337,26 @@ mod tests {
         assert_eq!(config.rope_theta, 1_000_000.0);
         assert_eq!(config.vocab_size, 151_936);
         assert!(config.tie_word_embeddings);
+    }
+
+    #[test]
+    fn benchmark_result_has_positive_values() {
+        let result = BenchmarkResult {
+            load_time_ms: 10.0,
+            prefill_tokens: 5,
+            prefill_time_ms: 20.0,
+            prefill_tokens_per_sec: 250.0,
+            decode_tokens: 7,
+            decode_time_ms: 30.0,
+            decode_tokens_per_sec: 233.33,
+        };
+
+        assert_eq!(result.load_time_ms, 10.0);
+        assert_eq!(result.prefill_tokens, 5);
+        assert_eq!(result.prefill_time_ms, 20.0);
+        assert_eq!(result.prefill_tokens_per_sec, 250.0);
+        assert_eq!(result.decode_tokens, 7);
+        assert_eq!(result.decode_time_ms, 30.0);
+        assert_eq!(result.decode_tokens_per_sec, 233.33);
     }
 }
