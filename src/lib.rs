@@ -3,6 +3,7 @@ pub mod display;
 pub mod embedding;
 pub mod ffn;
 pub mod kv_cache;
+pub mod matmul;
 pub mod model;
 pub mod output_head;
 pub mod rmsnorm;
