@@ -61,16 +61,24 @@ impl Model {
                     .tensor_f32(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?,
                 config.rms_norm_eps,
             );
-            let q_norm = RmsNorm::new(
-                tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.q_norm.weight"))?,
-                config.rms_norm_eps,
-            );
-            let k_norm = RmsNorm::new(
-                tensor_store
-                    .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.k_norm.weight"))?,
-                config.rms_norm_eps,
-            );
+            let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
+            let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
+            let q_norm = if tensor_store.has_tensor(&q_norm_name) {
+                Some(RmsNorm::new(
+                    tensor_store.tensor_f32(&q_norm_name)?,
+                    config.rms_norm_eps,
+                ))
+            } else {
+                None
+            };
+            let k_norm = if tensor_store.has_tensor(&k_norm_name) {
+                Some(RmsNorm::new(
+                    tensor_store.tensor_f32(&k_norm_name)?,
+                    config.rms_norm_eps,
+                ))
+            } else {
+                None
+            };
             let attention = Attention::new(
                 tensor_store
                     .tensor_f32(&format!("model.layers.{layer_idx}.self_attn.q_proj.weight"))?,

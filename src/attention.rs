@@ -6,8 +6,8 @@ pub struct Attention {
     wk: Vec<f32>,
     wv: Vec<f32>,
     wo: Vec<f32>,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     hidden_dim: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -22,8 +22,8 @@ impl Attention {
         wk: Vec<f32>,
         wv: Vec<f32>,
         wo: Vec<f32>,
-        q_norm: RmsNorm,
-        k_norm: RmsNorm,
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
         hidden_dim: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -76,11 +76,15 @@ impl Attention {
             let mut key = matmul(input, &self.wk, kv_dim, hidden_dim);
             let value = matmul(input, &self.wv, kv_dim, hidden_dim);
 
-            for head in query.chunks_exact_mut(self.head_dim) {
-                self.q_norm.forward(head);
+            if let Some(ref norm) = self.q_norm {
+                for head in query.chunks_exact_mut(self.head_dim) {
+                    norm.forward(head);
+                }
             }
-            for head in key.chunks_exact_mut(self.head_dim) {
-                self.k_norm.forward(head);
+            if let Some(ref norm) = self.k_norm {
+                for head in key.chunks_exact_mut(self.head_dim) {
+                    norm.forward(head);
+                }
             }
 
             apply_rope(&mut query, self.head_dim, start_pos + pos, self.rope_theta);
@@ -222,8 +226,8 @@ mod tests {
         RmsNorm::new(weight, 1e-6)
     }
 
-    fn unit_head_norm(head_dim: usize) -> RmsNorm {
-        head_norm(vec![1.0; head_dim])
+    fn unit_head_norm(head_dim: usize) -> Option<RmsNorm> {
+        Some(head_norm(vec![1.0; head_dim]))
     }
 
     #[test]
@@ -399,6 +403,31 @@ mod tests {
     }
 
     #[test]
+    fn forward_without_qk_norm() {
+        let hidden_dim = 8;
+        let attention = Attention::new(
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            identity_weight(hidden_dim),
+            None,
+            None,
+            hidden_dim,
+            2,
+            2,
+            4,
+            10.0,
+        );
+        let x = vec![1.0, 0.5, -1.0, 2.0, 0.25, -0.5, 1.5, -2.0];
+        let mut cache = LayerCache::new(hidden_dim);
+
+        let output = attention.forward(&x, 1, 0, &mut cache);
+
+        assert_eq!(output.len(), hidden_dim);
+        assert!(output.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn forward_with_kv_cache_incremental() {
         let hidden_dim = 8;
         let attention = Attention::new(
@@ -443,8 +472,8 @@ mod tests {
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
-            head_norm(vec![1.0; head_dim]),
-            head_norm(k_norm_weight.clone()),
+            Some(head_norm(vec![1.0; head_dim])),
+            Some(head_norm(k_norm_weight.clone())),
             hidden_dim,
             2,
             2,
@@ -459,8 +488,8 @@ mod tests {
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
             identity_weight(hidden_dim),
-            head_norm(vec![2.0; head_dim]),
-            head_norm(k_norm_weight),
+            Some(head_norm(vec![2.0; head_dim])),
+            Some(head_norm(k_norm_weight)),
             hidden_dim,
             2,
             2,

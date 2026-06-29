@@ -89,6 +89,10 @@ impl ShardedSafeTensors {
         })?;
         self.shards[*shard_index].tensor_f32(name)
     }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensor_to_shard.contains_key(name)
+    }
 }
 
 #[derive(Debug)]
@@ -131,6 +135,13 @@ impl TensorStore {
         match self {
             Self::Single(safetensors) => safetensors.tensor_f32(name),
             Self::Sharded(safetensors) => safetensors.tensor_f32(name),
+        }
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        match self {
+            Self::Single(safetensors) => safetensors.has_tensor(name),
+            Self::Sharded(safetensors) => safetensors.has_tensor(name),
         }
     }
 }
@@ -235,6 +246,10 @@ impl SafeTensors {
         };
 
         Ok(values)
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
     }
 
     pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
@@ -459,6 +474,42 @@ mod tests {
         assert_eq!(bias.dtype, Dtype::BF16);
         assert_eq!(bias.shape, vec![4]);
         assert_eq!(bias.data_offsets, [48, 56]);
+    }
+
+    #[test]
+    fn has_tensor_returns_true_for_existing() {
+        let file = create_test_safetensors(
+            serde_json::json!({
+                "values": {
+                    "dtype": "F32",
+                    "shape": [1],
+                    "data_offsets": [0, 4]
+                }
+            }),
+            &1.0f32.to_le_bytes(),
+        );
+
+        let tensors = SafeTensors::load(file.path()).unwrap();
+
+        assert!(tensors.has_tensor("values"));
+    }
+
+    #[test]
+    fn has_tensor_returns_false_for_missing() {
+        let file = create_test_safetensors(
+            serde_json::json!({
+                "values": {
+                    "dtype": "F32",
+                    "shape": [1],
+                    "data_offsets": [0, 4]
+                }
+            }),
+            &1.0f32.to_le_bytes(),
+        );
+
+        let tensors = SafeTensors::load(file.path()).unwrap();
+
+        assert!(!tensors.has_tensor("missing"));
     }
 
     #[test]
