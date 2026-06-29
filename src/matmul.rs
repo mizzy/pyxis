@@ -1,5 +1,17 @@
 use crate::weights::Weights;
 use rayon::prelude::*;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+
+#[cfg(target_os = "macos")]
+static METAL: OnceLock<Option<crate::metal_matmul::MetalMatmul>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn get_metal() -> Option<&'static crate::metal_matmul::MetalMatmul> {
+    METAL
+        .get_or_init(crate::metal_matmul::MetalMatmul::new)
+        .as_ref()
+}
 
 pub fn matmul(
     input: &[f32],
@@ -26,6 +38,11 @@ pub fn matmul(
         assert!(*block_size > 0);
         assert_eq!(data.len(), num_elements.div_ceil(2));
         assert_eq!(scales.len(), num_elements.div_ceil(*block_size));
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Weights::F32(values) = weight && values.len() > 4096 && let Some(metal) = get_metal() {
+        return metal.matmul(input, values, out_features, in_features);
     }
 
     (0..out_features)

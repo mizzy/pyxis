@@ -5,6 +5,8 @@ pub mod ffn;
 pub mod gguf;
 pub mod kv_cache;
 pub mod matmul;
+#[cfg(target_os = "macos")]
+pub mod metal_matmul;
 pub mod model;
 pub mod output_head;
 pub mod rmsnorm;
