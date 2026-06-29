@@ -1,4 +1,5 @@
 use crate::kv_cache::LayerCache;
+use crate::matmul::matmul;
 use crate::rmsnorm::RmsNorm;
 
 pub struct Attention {
@@ -139,22 +140,6 @@ impl Attention {
     }
 }
 
-fn matmul(input: &[f32], weight: &[f32], out_features: usize, in_features: usize) -> Vec<f32> {
-    assert_eq!(input.len(), in_features);
-    assert_eq!(weight.len(), out_features * in_features);
-
-    let mut output = vec![0.0; out_features];
-
-    for (out_idx, output_value) in output.iter_mut().enumerate().take(out_features) {
-        let row_start = out_idx * in_features;
-        *output_value = (0..in_features)
-            .map(|in_idx| input[in_idx] * weight[row_start + in_idx])
-            .sum();
-    }
-
-    output
-}
-
 fn apply_rope(q_or_k: &mut [f32], head_dim: usize, pos: usize, theta: f32) {
     assert_eq!(q_or_k.len() % head_dim, 0);
     assert_eq!(head_dim % 2, 0);
@@ -227,16 +212,6 @@ mod tests {
 
     fn unit_head_norm(head_dim: usize) -> Option<RmsNorm> {
         Some(head_norm(vec![1.0; head_dim]))
-    }
-
-    #[test]
-    fn matmul_computes_correctly() {
-        let input = vec![1.0, 2.0, 3.0];
-        let weight = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-
-        let output = matmul(&input, &weight, 2, 3);
-
-        assert_vec_close(&output, &[1.0, 2.0]);
     }
 
     #[test]

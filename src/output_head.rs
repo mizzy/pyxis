@@ -1,3 +1,5 @@
+use crate::matmul::matmul;
+
 pub struct OutputHead {
     weight: Vec<f32>,
     vocab_size: usize,
@@ -16,18 +18,7 @@ impl OutputHead {
     }
 
     pub fn logits(&self, hidden_state: &[f32]) -> Vec<f32> {
-        assert_eq!(hidden_state.len(), self.hidden_dim);
-
-        let mut logits = vec![0.0; self.vocab_size];
-
-        for (token_idx, logit) in logits.iter_mut().enumerate() {
-            let row_start = token_idx * self.hidden_dim;
-            *logit = (0..self.hidden_dim)
-                .map(|hidden_idx| hidden_state[hidden_idx] * self.weight[row_start + hidden_idx])
-                .sum();
-        }
-
-        logits
+        matmul(hidden_state, &self.weight, self.vocab_size, self.hidden_dim)
     }
 
     pub fn greedy(&self, hidden_state: &[f32]) -> usize {
@@ -57,11 +48,7 @@ mod tests {
 
     #[test]
     fn logits_with_identity_weight() {
-        let output_head = OutputHead::new(
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            3,
-            3,
-        );
+        let output_head = OutputHead::new(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 3, 3);
 
         let logits = output_head.logits(&[1.0, 2.0, 3.0]);
 

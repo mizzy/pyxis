@@ -1,3 +1,5 @@
+use crate::matmul::matmul;
+
 pub struct Ffn {
     gate_proj: Vec<f32>,
     up_proj: Vec<f32>,
@@ -48,22 +50,6 @@ impl Ffn {
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
-}
-
-fn matmul(input: &[f32], weight: &[f32], out_features: usize, in_features: usize) -> Vec<f32> {
-    assert_eq!(input.len(), in_features);
-    assert_eq!(weight.len(), out_features * in_features);
-
-    let mut output = vec![0.0; out_features];
-
-    for (out_idx, output_value) in output.iter_mut().enumerate().take(out_features) {
-        let row_start = out_idx * in_features;
-        *output_value = (0..in_features)
-            .map(|in_idx| input[in_idx] * weight[row_start + in_idx])
-            .sum();
-    }
-
-    output
 }
 
 #[cfg(test)]
