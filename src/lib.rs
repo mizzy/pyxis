@@ -2,6 +2,7 @@ pub mod attention;
 pub mod display;
 pub mod embedding;
 pub mod ffn;
+pub mod gguf;
 pub mod kv_cache;
 pub mod matmul;
 pub mod model;
