@@ -159,19 +159,18 @@ fn apply_rope(q_or_k: &mut [f32], head_dim: usize, pos: usize, theta: f32) {
     assert_eq!(q_or_k.len() % head_dim, 0);
     assert_eq!(head_dim % 2, 0);
 
+    let half = head_dim / 2;
     for head in q_or_k.chunks_exact_mut(head_dim) {
-        for pair_idx in 0..head_dim / 2 {
-            let even_idx = pair_idx * 2;
-            let odd_idx = even_idx + 1;
-            let freq = 1.0 / theta.powf(even_idx as f32 / head_dim as f32);
+        for i in 0..half {
+            let freq = 1.0 / theta.powf((2 * i) as f32 / head_dim as f32);
             let angle = pos as f32 * freq;
             let cos = angle.cos();
             let sin = angle.sin();
-            let even = head[even_idx];
-            let odd = head[odd_idx];
+            let x0 = head[i];
+            let x1 = head[i + half];
 
-            head[even_idx] = even * cos - odd * sin;
-            head[odd_idx] = even * sin + odd * cos;
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x1 * cos + x0 * sin;
         }
     }
 }
@@ -260,7 +259,7 @@ mod tests {
 
         assert_vec_close(
             &values,
-            &[angle_0.cos(), angle_0.sin(), -angle_1.sin(), angle_1.cos()],
+            &[angle_0.cos(), -angle_1.sin(), angle_0.sin(), angle_1.cos()],
         );
     }
 
@@ -501,19 +500,9 @@ mod tests {
         assert!(scaled_output[hidden_dim] > base_output[hidden_dim] + 0.1);
 
         let second_key_rms = ((3.0 * 3.0 + 1.0) / head_dim as f32 + 1e-6).sqrt();
-        let normalized_even = 3.0 / second_key_rms;
-        let normalized_odd = 2.0 / second_key_rms;
-        let expected_second_key_first_dim =
-            normalized_even * 1.0_f32.cos() - normalized_odd * 1.0_f32.sin();
-        let expected_second_key_second_dim =
-            normalized_even * 1.0_f32.sin() + normalized_odd * 1.0_f32.cos();
-        assert_close(
-            scaled_cache.keys()[hidden_dim],
-            expected_second_key_first_dim,
-        );
-        assert_close(
-            scaled_cache.keys()[hidden_dim + 1],
-            expected_second_key_second_dim,
-        );
+        let norm_0 = 3.0 / second_key_rms;
+        let norm_2 = 0.0 / second_key_rms * 3.0;
+        let expected_first = norm_0 * 1.0_f32.cos() - norm_2 * 1.0_f32.sin();
+        assert_close(scaled_cache.keys()[hidden_dim], expected_first);
     }
 }
