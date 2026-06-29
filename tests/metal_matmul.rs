@@ -82,3 +82,66 @@ fn metal_matmul_matches_cpu() {
 
     assert_vec_close(&actual, &expected);
 }
+
+#[test]
+fn metal_buffer_matmul_matches_cpu() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 16;
+    let in_features = 17;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 7.0) - 3.0)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 17 + 11) % 23) as f32 / 7.0 - 1.5)
+        .collect();
+    let weight_buffer = metal.create_buffer(&weight);
+
+    let actual_with_buffer =
+        metal.matmul_with_buffer(&input, &weight_buffer, out_features, in_features);
+    let metal_weights = Weights::MetalF32 {
+        buffer: weight_buffer,
+        len: weight.len(),
+    };
+    let actual = matmul(&input, &metal_weights, out_features, in_features);
+    let expected = matmul(&input, &Weights::F32(weight), out_features, in_features);
+
+    assert_vec_close(&actual_with_buffer, &expected);
+    assert_vec_close(&actual, &expected);
+}
+
+#[test]
+fn weights_to_metal_f32() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let weights = Weights::F32(vec![1.0, 2.0, 3.0, 4.0]);
+
+    let metal_weights = weights.to_metal(&metal);
+
+    assert_eq!(metal_weights.len(), 4);
+    let Weights::MetalF32 { len, .. } = metal_weights else {
+        panic!("expected MetalF32 weights");
+    };
+    assert_eq!(len, 4);
+}
+
+#[test]
+fn weights_to_metal_bf16() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let weights = Weights::Bf16(vec![
+        (1.5_f32.to_bits() >> 16) as u16,
+        ((-2.0_f32).to_bits() >> 16) as u16,
+    ]);
+
+    let metal_weights = weights.to_metal(&metal);
+
+    assert_eq!(metal_weights.len(), 2);
+    let Weights::MetalF32 { len, .. } = metal_weights else {
+        panic!("expected MetalF32 weights");
+    };
+    assert_eq!(len, 2);
+}

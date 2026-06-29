@@ -64,20 +64,43 @@ impl MetalMatmul {
             return Vec::new();
         }
 
+        let weight_buf = self.create_buffer(weight);
+        self.matmul_with_buffer(input, &weight_buf, out_features, in_features)
+    }
+
+    pub fn create_buffer(&self, data: &[f32]) -> Buffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            mem::size_of_val(data) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    pub fn matmul_with_buffer(
+        &self,
+        input: &[f32],
+        weight_buffer: &Buffer,
+        out_features: usize,
+        in_features: usize,
+    ) -> Vec<f32> {
+        assert_eq!(input.len(), in_features);
+        assert_eq!(
+            weight_buffer.length(),
+            (out_features * in_features * mem::size_of::<f32>()) as u64
+        );
+
+        if out_features == 0 {
+            return Vec::new();
+        }
+
         let in_features_u32 =
             u32::try_from(in_features).expect("in_features exceeds Metal shader uint range");
         let out_features_u32 =
             u32::try_from(out_features).expect("out_features exceeds Metal shader uint range");
 
-
         let input_buf = self.device.new_buffer_with_data(
             input.as_ptr() as *const c_void,
             mem::size_of_val(input) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let weight_buf = self.device.new_buffer_with_data(
-            weight.as_ptr() as *const c_void,
-            mem::size_of_val(weight) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let output_buf = self.device.new_buffer(
@@ -90,7 +113,7 @@ impl MetalMatmul {
 
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&input_buf), 0);
-        encoder.set_buffer(1, Some(&weight_buf), 0);
+        encoder.set_buffer(1, Some(weight_buffer), 0);
         encoder.set_buffer(2, Some(&output_buf), 0);
         encoder.set_bytes(
             3,

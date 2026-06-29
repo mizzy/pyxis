@@ -13,6 +13,11 @@ fn get_metal() -> Option<&'static crate::metal_matmul::MetalMatmul> {
         .as_ref()
 }
 
+#[cfg(target_os = "macos")]
+pub fn get_metal_ref() -> Option<&'static crate::metal_matmul::MetalMatmul> {
+    get_metal()
+}
+
 pub fn matmul(
     input: &[f32],
     weight: &Weights,
@@ -41,7 +46,18 @@ pub fn matmul(
     }
 
     #[cfg(target_os = "macos")]
-    if let Weights::F32(values) = weight && values.len() > 4096 && let Some(metal) = get_metal() {
+    if let Weights::MetalF32 { buffer, .. } = weight {
+        if let Some(metal) = get_metal() {
+            return metal.matmul_with_buffer(input, buffer, out_features, in_features);
+        }
+        panic!("MetalF32 weights require Metal device");
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Weights::F32(values) = weight
+        && values.len() > 4096
+        && let Some(metal) = get_metal()
+    {
         return metal.matmul(input, values, out_features, in_features);
     }
 
@@ -67,6 +83,8 @@ pub fn matmul(
                     block_size,
                     ..
                 } => dot_product_int4(input, data, scales, *block_size, row_start, in_features),
+                #[cfg(target_os = "macos")]
+                Weights::MetalF32 { .. } => unreachable!("MetalF32 weights are handled above"),
             }
         })
         .collect()

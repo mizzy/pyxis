@@ -81,7 +81,7 @@ enum Quantization {
 }
 
 impl Model {
-    pub fn load(model_path: &Path, quantize: Option<&str>) -> io::Result<Self> {
+    pub fn load(model_path: &Path, quantize: Option<&str>, use_metal: bool) -> io::Result<Self> {
         let quantization = quantize.map(parse_quantization).transpose()?;
         let (tokenizer, config, tensor_store) = if is_gguf_path(model_path) {
             load_gguf_inputs(model_path)?
@@ -92,12 +92,14 @@ impl Model {
                 TensorStore::load(model_path)?,
             )
         };
-        let maybe_quantize = |weights, out_features, in_features| match quantization {
-            Some(quantization) => {
-                quantize_weights(weights, out_features, in_features, quantization)
-            }
-            None => weights,
-        };
+        let prepare_weights =
+            |weights: Weights, out_features: usize, in_features: usize| match quantization {
+                Some(quantization) => maybe_metal_weights(
+                    quantize_weights(weights, out_features, in_features, quantization),
+                    use_metal,
+                ),
+                None => maybe_metal_weights(weights, use_metal),
+            };
 
         let embed_tokens_weight = tensor_store.tensor_f32("model.embed_tokens.weight")?;
         let embedding = Embedding::new(
@@ -134,28 +136,28 @@ impl Model {
             let q_dim = config.num_attention_heads * config.head_dim;
             let kv_dim = config.num_key_value_heads * config.head_dim;
             let attention = Attention::new(
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.self_attn.q_proj.weight"
                     ))?,
                     q_dim,
                     config.hidden_size,
                 ),
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.self_attn.k_proj.weight"
                     ))?,
                     kv_dim,
                     config.hidden_size,
                 ),
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.self_attn.v_proj.weight"
                     ))?,
                     kv_dim,
                     config.hidden_size,
                 ),
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.self_attn.o_proj.weight"
                     ))?,
@@ -177,20 +179,20 @@ impl Model {
                 config.rms_norm_eps,
             );
             let ffn = Ffn::new(
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.mlp.gate_proj.weight"
                     ))?,
                     config.intermediate_size,
                     config.hidden_size,
                 ),
-                maybe_quantize(
+                prepare_weights(
                     tensor_store
                         .tensor_weights(&format!("model.layers.{layer_idx}.mlp.up_proj.weight"))?,
                     config.intermediate_size,
                     config.hidden_size,
                 ),
-                maybe_quantize(
+                prepare_weights(
                     tensor_store.tensor_weights(&format!(
                         "model.layers.{layer_idx}.mlp.down_proj.weight"
                     ))?,
@@ -219,7 +221,7 @@ impl Model {
         } else {
             tensor_store.tensor_weights("lm_head.weight")?
         };
-        let output_weight = maybe_quantize(output_weight, config.vocab_size, config.hidden_size);
+        let output_weight = prepare_weights(output_weight, config.vocab_size, config.hidden_size);
         let output_head = OutputHead::new(output_weight, config.vocab_size, config.hidden_size);
         let sampler = Sampler::new(0.7, 0.9, 1.2);
 
@@ -346,6 +348,23 @@ impl Model {
             decode_tokens_per_sec: tokens_per_second(decode_tokens, decode_time_ms),
         }
     }
+}
+
+fn maybe_metal_weights(weights: Weights, use_metal: bool) -> Weights {
+    #[cfg(target_os = "macos")]
+    {
+        if use_metal
+            && matches!(&weights, Weights::F32(_) | Weights::Bf16(_))
+            && let Some(metal) = crate::matmul::get_metal_ref()
+        {
+            return weights.to_metal(metal);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = use_metal;
+
+    weights
 }
 
 fn read_config(path: &Path) -> io::Result<ModelConfig> {
@@ -542,6 +561,8 @@ fn dequantize_weights(weights: Weights) -> Vec<f32> {
                 (nibble as f32 - 8.0) * scales[index / block_size]
             })
             .collect(),
+        #[cfg(target_os = "macos")]
+        Weights::MetalF32 { .. } => panic!("cannot dequantize MetalF32 weights"),
     }
 }
 
