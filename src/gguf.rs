@@ -169,9 +169,8 @@ impl GgufFile {
                         .collect(),
                 ))
             }
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q8_0 => {
-                Ok(Weights::F32(self.tensor_f32(name)?))
-            }
+            GgmlType::Q8_0 => self.read_q8_0_weights(data_start, n_elements),
+            GgmlType::F32 | GgmlType::F16 => Ok(Weights::F32(self.tensor_f32(name)?)),
         }
     }
 
@@ -242,6 +241,33 @@ impl GgufFile {
         }
         result.truncate(n_elements);
         Ok(result)
+    }
+
+    fn read_q8_0_weights(&self, start: u64, n_elements: usize) -> io::Result<Weights> {
+        let block_size = 32;
+        let bytes_per_block = 34;
+        let n_blocks = n_elements.div_ceil(block_size);
+        let byte_len = checked_byte_len(n_blocks, bytes_per_block)?;
+        let bytes = self.tensor_bytes(start, byte_len)?;
+
+        let mut data = Vec::with_capacity(n_elements);
+        let mut scales = Vec::with_capacity(n_blocks);
+
+        for block in bytes.chunks_exact(bytes_per_block) {
+            let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+            scales.push(scale);
+            for &value in &block[2..] {
+                data.push(value as i8);
+            }
+        }
+        data.truncate(n_elements);
+
+        Ok(Weights::Int8 {
+            data,
+            scales,
+            block_size,
+            num_elements: n_elements,
+        })
     }
 
     fn tensor_bytes(&self, start: u64, byte_len: usize) -> io::Result<&[u8]> {

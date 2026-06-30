@@ -72,24 +72,39 @@ fn q8_0_dequantize_known_values() {
 }
 
 #[test]
-fn q8_0_tensor_weights_returns_f32() {
+fn tensor_weights_q8_0_returns_int8() {
     let mut file = tempfile::NamedTempFile::new().expect("create temp file");
     let mut data = Vec::new();
     data.extend_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
     for value in 0i8..32 {
         data.push(value as u8);
     }
-    write_minimal_gguf(&mut file, "q8.weight", &[32], 8, &data);
+    data.extend_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+    for value in -16i8..16 {
+        data.push(value as u8);
+    }
+    write_minimal_gguf(&mut file, "q8.weight", &[40], 8, &data);
     file.flush().expect("flush gguf");
 
     let gguf = GgufFile::parse(file.path()).expect("parse gguf");
     let weights = gguf.tensor_weights("q8.weight").expect("read q8 weights");
 
-    let Weights::F32(values) = weights else {
-        panic!("expected f32 weights");
+    let Weights::Int8 {
+        data,
+        scales,
+        block_size,
+        num_elements,
+    } = weights
+    else {
+        panic!("expected int8 weights");
     };
-    assert_eq!(values[0], 0.0);
-    assert_eq!(values[31], 31.0 * 0.25);
+    let mut expected_data: Vec<i8> = (0i8..32).collect();
+    expected_data.extend(-16i8..-8);
+
+    assert_eq!(block_size, 32);
+    assert_eq!(num_elements, 40);
+    assert_eq!(scales, vec![0.25, 0.5]);
+    assert_eq!(data, expected_data);
 }
 
 #[test]
