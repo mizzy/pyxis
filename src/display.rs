@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::gguf::GgufTensorInfo;
 use crate::safetensors::TensorInfo;
 
 /// Format a tensor table with auto-sized columns based on actual content widths.
@@ -73,6 +74,66 @@ pub fn format_tensor_table(tensors: &HashMap<String, TensorInfo>) -> String {
     }
 
     // Summary
+    writeln!(output, "\nTotal: {} tensors", tensors.len()).unwrap();
+
+    output
+}
+
+pub fn format_gguf_tensor_table(tensors: &[GgufTensorInfo]) -> String {
+    let mut tensors: Vec<&GgufTensorInfo> = tensors.iter().collect();
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let header = ["Tensor", "Type", "Shape"];
+
+    let rows: Vec<[String; 3]> = tensors
+        .iter()
+        .map(|tensor| {
+            [
+                tensor.name.clone(),
+                format!("{:?}", tensor.tensor_type),
+                format!("{:?}", tensor.dims),
+            ]
+        })
+        .collect();
+
+    let mut widths = header.map(|h| h.len());
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let mut output = String::new();
+
+    writeln!(
+        output,
+        "{:<w0$}  {:>w1$}  {:>w2$}",
+        header[0],
+        header[1],
+        header[2],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+    )
+    .unwrap();
+
+    let total_width = widths.iter().sum::<usize>() + 4;
+    writeln!(output, "{}", "-".repeat(total_width)).unwrap();
+
+    for row in &rows {
+        writeln!(
+            output,
+            "{:<w0$}  {:>w1$}  {:>w2$}",
+            row[0],
+            row[1],
+            row[2],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+        )
+        .unwrap();
+    }
+
     writeln!(output, "\nTotal: {} tensors", tensors.len()).unwrap();
 
     output
