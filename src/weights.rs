@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use metal::Buffer;
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, mem};
 
 #[derive(Debug, Clone)]
 pub enum Weights {
@@ -22,6 +24,11 @@ pub enum Weights {
         buffer: Buffer,
         len: usize,
     },
+    #[cfg(target_os = "macos")]
+    MetalBf16 {
+        buffer: Buffer,
+        len: usize,
+    },
 }
 
 impl Weights {
@@ -33,6 +40,8 @@ impl Weights {
             Self::Int4 { num_elements, .. } => *num_elements,
             #[cfg(target_os = "macos")]
             Self::MetalF32 { len, .. } => *len,
+            #[cfg(target_os = "macos")]
+            Self::MetalBf16 { len, .. } => *len,
         }
     }
 
@@ -48,6 +57,8 @@ impl Weights {
             Self::Int4 { .. } => panic!("cannot get f32 slice from int4 weights"),
             #[cfg(target_os = "macos")]
             Self::MetalF32 { .. } => panic!("cannot get f32 slice from MetalF32 weights"),
+            #[cfg(target_os = "macos")]
+            Self::MetalBf16 { .. } => panic!("cannot get f32 slice from MetalBf16 weights"),
         }
     }
 
@@ -62,17 +73,19 @@ impl Weights {
                 }
             }
             Self::Bf16(data) => {
-                let f32_data: Vec<f32> = data
-                    .iter()
-                    .map(|&value| f32::from_bits((value as u32) << 16))
-                    .collect();
-                let buffer = metal.create_buffer(&f32_data);
-                Self::MetalF32 {
+                let buffer = metal.create_buffer_raw(
+                    data.as_ptr() as *const c_void,
+                    data.len() * mem::size_of::<u16>(),
+                );
+                Self::MetalBf16 {
                     buffer,
-                    len: f32_data.len(),
+                    len: data.len(),
                 }
             }
-            Self::Int8 { .. } | Self::Int4 { .. } | Self::MetalF32 { .. } => {
+            Self::Int8 { .. }
+            | Self::Int4 { .. }
+            | Self::MetalF32 { .. }
+            | Self::MetalBf16 { .. } => {
                 panic!("to_metal only supports F32 and Bf16 weights")
             }
         }
