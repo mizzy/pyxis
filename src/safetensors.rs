@@ -172,6 +172,20 @@ impl TensorStore {
             Self::Gguf(gguf) => gguf.has_tensor_by_pyxis_name(name),
         }
     }
+
+    pub fn tensors(&self) -> HashMap<String, TensorInfo> {
+        match self {
+            Self::Single(safetensors) => safetensors.tensors().clone(),
+            Self::Sharded(sharded) => {
+                let mut all = HashMap::new();
+                for shard in &sharded.shards {
+                    all.extend(shard.tensors().clone());
+                }
+                all
+            }
+            Self::Gguf(_) => HashMap::new(),
+        }
+    }
 }
 
 impl SafeTensors {

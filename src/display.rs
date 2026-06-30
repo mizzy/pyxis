@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::gguf::GgufTensorInfo;
 use crate::safetensors::TensorInfo;
 
 /// Format a tensor table with auto-sized columns based on actual content widths.
@@ -73,6 +74,71 @@ pub fn format_tensor_table(tensors: &HashMap<String, TensorInfo>) -> String {
     }
 
     // Summary
+    writeln!(output, "\nTotal: {} tensors", tensors.len()).unwrap();
+
+    output
+}
+
+pub fn format_gguf_tensor_table(tensors: &[GgufTensorInfo]) -> String {
+    let mut tensors: Vec<&GgufTensorInfo> = tensors.iter().collect();
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let header = ["Tensor", "Type", "Shape", "Offset"];
+
+    let rows: Vec<[String; 4]> = tensors
+        .iter()
+        .map(|tensor| {
+            [
+                tensor.name.clone(),
+                format!("{:?}", tensor.tensor_type),
+                format!("{:?}", tensor.dims),
+                format!("{}", tensor.offset),
+            ]
+        })
+        .collect();
+
+    let mut widths = header.map(|h| h.len());
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let mut output = String::new();
+
+    writeln!(
+        output,
+        "{:<w0$}  {:>w1$}  {:>w2$}  {:>w3$}",
+        header[0],
+        header[1],
+        header[2],
+        header[3],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+        w3 = widths[3],
+    )
+    .unwrap();
+
+    let total_width = widths.iter().sum::<usize>() + 6;
+    writeln!(output, "{}", "-".repeat(total_width)).unwrap();
+
+    for row in &rows {
+        writeln!(
+            output,
+            "{:<w0$}  {:>w1$}  {:>w2$}  {:>w3$}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+        )
+        .unwrap();
+    }
+
     writeln!(output, "\nTotal: {} tensors", tensors.len()).unwrap();
 
     output

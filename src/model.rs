@@ -469,7 +469,7 @@ fn gguf_required_f32(gguf: &GgufFile, arch: &str, suffix: &str) -> io::Result<f3
     })
 }
 
-fn is_gguf_path(path: &Path) -> bool {
+pub fn is_gguf_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
