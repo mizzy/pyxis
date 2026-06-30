@@ -564,6 +564,8 @@ fn dequantize_weights(weights: Weights) -> Vec<f32> {
             .collect(),
         #[cfg(target_os = "macos")]
         Weights::MetalF32 { .. } => panic!("cannot dequantize MetalF32 weights"),
+        #[cfg(target_os = "macos")]
+        Weights::MetalBf16 { .. } => panic!("cannot dequantize MetalBf16 weights"),
     }
 }
 

@@ -56,6 +56,13 @@ pub fn matmul(
         }
         panic!("MetalF32 weights require Metal device");
     }
+    #[cfg(target_os = "macos")]
+    if let Weights::MetalBf16 { buffer, .. } = weight {
+        if let Some(metal) = get_metal() {
+            return metal.matmul_bf16_with_buffer(input, buffer, out_features, in_features);
+        }
+        panic!("MetalBf16 weights require Metal device");
+    }
 
     (0..out_features)
         .into_par_iter()
@@ -82,6 +89,8 @@ pub fn matmul(
                 } => dot_product_int4(input, data, scales, *block_size, row_start, in_features),
                 #[cfg(target_os = "macos")]
                 Weights::MetalF32 { .. } => unreachable!("MetalF32 weights are handled above"),
+                #[cfg(target_os = "macos")]
+                Weights::MetalBf16 { .. } => unreachable!("MetalBf16 weights are handled above"),
             }
         })
         .collect()
