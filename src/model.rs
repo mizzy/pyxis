@@ -519,12 +519,12 @@ fn quantize_weights(
 
 fn quantize_f32_values(
     values: &[f32],
-    out_features: usize,
+    _out_features: usize,
     in_features: usize,
     quantization: Quantization,
 ) -> Weights {
     match quantization {
-        Quantization::Int8 => Weights::quantize_int8(values, out_features, in_features),
+        Quantization::Int8 => Weights::quantize_int8(values, in_features),
         Quantization::Int4 => Weights::quantize_int4(values, INT4_BLOCK_SIZE),
     }
 }
@@ -539,11 +539,12 @@ fn dequantize_weights(weights: Weights) -> Vec<f32> {
         Weights::Int8 {
             data,
             scales,
-            row_size,
+            block_size,
+            ..
         } => data
             .into_iter()
             .enumerate()
-            .map(|(index, value)| value as f32 * scales[index / row_size])
+            .map(|(index, value)| value as f32 * scales[index / block_size])
             .collect(),
         Weights::Int4 {
             data,
@@ -632,7 +633,8 @@ mod tests {
         let Weights::Int8 {
             data,
             scales,
-            row_size,
+            block_size,
+            num_elements,
         } = weights
         else {
             panic!("expected int8 weights");
@@ -640,7 +642,8 @@ mod tests {
 
         assert_eq!(data.len(), 4);
         assert_eq!(scales.len(), 2);
-        assert_eq!(row_size, 2);
+        assert_eq!(block_size, 2);
+        assert_eq!(num_elements, 4);
         assert!((scales[0] - 2.0 / 127.0).abs() < f32::EPSILON);
         assert!((scales[1] - 4.0 / 127.0).abs() < f32::EPSILON);
     }
@@ -655,7 +658,8 @@ mod tests {
         let Weights::Int8 {
             data,
             scales,
-            row_size,
+            block_size,
+            num_elements,
         } = weights
         else {
             panic!("expected int8 weights");
@@ -663,7 +667,8 @@ mod tests {
 
         assert_eq!(data.len(), 2);
         assert_eq!(scales, vec![2.0 / 127.0]);
-        assert_eq!(row_size, 2);
+        assert_eq!(block_size, 2);
+        assert_eq!(num_elements, 2);
     }
 
     #[test]

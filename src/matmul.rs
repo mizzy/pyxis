@@ -27,11 +27,15 @@ pub fn matmul(
     assert_eq!(input.len(), in_features);
     assert_eq!(weight.len(), out_features * in_features);
     if let Weights::Int8 {
-        scales, row_size, ..
+        block_size,
+        num_elements,
+        scales,
+        ..
     } = weight
     {
-        assert_eq!(*row_size, in_features);
-        assert_eq!(scales.len(), out_features);
+        assert!(*block_size > 0);
+        assert_eq!(*num_elements, out_features * in_features);
+        assert_eq!(scales.len(), num_elements.div_ceil(*block_size));
     }
     if let Weights::Int4 {
         data,
@@ -64,11 +68,12 @@ pub fn matmul(
                 Weights::Bf16(values) => {
                     dot_product_bf16(input, &values[row_start..row_start + in_features])
                 }
-                Weights::Int8 { data, scales, .. } => dot_product_int8(
-                    input,
-                    &data[row_start..row_start + in_features],
-                    scales[out_idx],
-                ),
+                Weights::Int8 {
+                    data,
+                    scales,
+                    block_size,
+                    ..
+                } => dot_product_int8(input, data, scales, *block_size, row_start, in_features),
                 Weights::Int4 {
                     data,
                     scales,
@@ -110,17 +115,25 @@ fn dot_product_bf16(a: &[f32], b_bf16: &[u16]) -> f32 {
     }
 }
 
-fn dot_product_int8(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
-    assert_eq!(input.len(), quantized.len());
+fn dot_product_int8(
+    input: &[f32],
+    quantized: &[i8],
+    scales: &[f32],
+    block_size: usize,
+    offset: usize,
+    len: usize,
+) -> f32 {
+    assert_eq!(input.len(), len);
+    assert!(block_size > 0);
 
     #[cfg(target_arch = "aarch64")]
     {
-        dot_product_int8_neon(input, quantized, scale)
+        dot_product_int8_neon(input, quantized, scales, block_size, offset, len)
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        dot_product_int8_scalar(input, quantized, scale)
+        dot_product_int8_scalar(input, quantized, scales, block_size, offset, len)
     }
 }
 
@@ -205,34 +218,58 @@ fn dot_product_bf16_neon(a: &[f32], b_bf16: &[u16]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn dot_product_int8_neon(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
+fn dot_product_int8_neon(
+    input: &[f32],
+    quantized: &[i8],
+    scales: &[f32],
+    block_size: usize,
+    offset: usize,
+    len: usize,
+) -> f32 {
     use std::arch::aarch64::*;
 
-    assert_eq!(input.len(), quantized.len());
+    assert_eq!(input.len(), len);
+    assert!(block_size > 0);
 
-    let chunks = input.len() / 4;
-    let mut sum = unsafe { vdupq_n_f32(0.0) };
+    let mut result = 0.0;
+    let mut processed = 0;
 
-    for chunk in 0..chunks {
-        let offset = chunk * 4;
-        let va = unsafe { vld1q_f32(input.as_ptr().add(offset)) };
-        let quantized_f32 = [
-            quantized[offset] as f32,
-            quantized[offset + 1] as f32,
-            quantized[offset + 2] as f32,
-            quantized[offset + 3] as f32,
-        ];
-        let vb = unsafe { vld1q_f32(quantized_f32.as_ptr()) };
-        sum = unsafe { vfmaq_f32(sum, va, vb) };
+    while processed < len {
+        let global_start = offset + processed;
+        let block_idx = global_start / block_size;
+        let block_end = ((block_idx + 1) * block_size).min(offset + len);
+        let block_len = block_end - global_start;
+        let chunks = block_len / 4;
+        let mut block_sum = unsafe { vdupq_n_f32(0.0) };
+
+        for chunk in 0..chunks {
+            let local = processed + chunk * 4;
+            let global_idx = offset + local;
+            let va = unsafe { vld1q_f32(input.as_ptr().add(local)) };
+            let quantized_f32 = [
+                quantized[global_idx] as f32,
+                quantized[global_idx + 1] as f32,
+                quantized[global_idx + 2] as f32,
+                quantized[global_idx + 3] as f32,
+            ];
+            let vb = unsafe { vld1q_f32(quantized_f32.as_ptr()) };
+            block_sum = unsafe { vfmaq_f32(block_sum, va, vb) };
+        }
+
+        let mut block_result = unsafe { vaddvq_f32(block_sum) };
+        let tail_start = processed + chunks * 4;
+        let tail_end = processed + block_len;
+        for (tail_offset, input_value) in input[tail_start..tail_end].iter().enumerate() {
+            let local = tail_start + tail_offset;
+            let global_idx = offset + local;
+            block_result += *input_value * quantized[global_idx] as f32;
+        }
+
+        result += block_result * scales[block_idx];
+        processed += block_len;
     }
 
-    let mut result = unsafe { vaddvq_f32(sum) };
-
-    for index in chunks * 4..input.len() {
-        result += input[index] * quantized[index] as f32;
-    }
-
-    result * scale
+    result
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -249,13 +286,25 @@ fn dot_product_bf16_scalar(a: &[f32], b_bf16: &[u16]) -> f32 {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn dot_product_int8_scalar(input: &[f32], quantized: &[i8], scale: f32) -> f32 {
+fn dot_product_int8_scalar(
+    input: &[f32],
+    quantized: &[i8],
+    scales: &[f32],
+    block_size: usize,
+    offset: usize,
+    len: usize,
+) -> f32 {
+    assert_eq!(input.len(), len);
+    assert!(block_size > 0);
+
     input
         .iter()
-        .zip(quantized)
-        .map(|(input, quantized)| input * *quantized as f32)
-        .sum::<f32>()
-        * scale
+        .enumerate()
+        .map(|(index, input)| {
+            let global_idx = offset + index;
+            input * quantized[global_idx] as f32 * scales[global_idx / block_size]
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -360,11 +409,17 @@ mod tests {
     fn dot_product_int8_matches_f32() {
         let input = vec![0.5, -2.0, 1.5, 4.0];
         let weight = vec![1.0, -0.5, 2.0, -3.0];
-        let Weights::Int8 { data, scales, .. } = Weights::quantize_int8(&weight, 1, 4) else {
+        let Weights::Int8 {
+            data,
+            scales,
+            block_size,
+            ..
+        } = Weights::quantize_int8(&weight, 4)
+        else {
             panic!("expected int8 weights");
         };
 
-        let actual = dot_product_int8(&input, &data, scales[0]);
+        let actual = dot_product_int8(&input, &data, &scales, block_size, 0, input.len());
         let expected = dot_product(&input, &weight);
 
         assert!(
@@ -392,7 +447,7 @@ mod tests {
     fn matmul_with_int8_weights() {
         let input = vec![1.0, 2.0, -1.0];
         let weight_f32 = vec![1.5, -0.5, 2.0, 0.25, 3.0, -1.0];
-        let weight_int8 = Weights::quantize_int8(&weight_f32, 2, 3);
+        let weight_int8 = Weights::quantize_int8(&weight_f32, 3);
 
         let output = matmul(&input, &weight_int8, 2, 3);
         let expected = matmul(&input, &Weights::F32(weight_f32), 2, 3);
