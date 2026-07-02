@@ -97,8 +97,9 @@ impl Model {
                 Some(quantization) => maybe_metal_weights(
                     quantize_weights(weights, out_features, in_features, quantization),
                     use_metal,
+                    in_features,
                 ),
-                None => maybe_metal_weights(weights, use_metal),
+                None => maybe_metal_weights(weights, use_metal, in_features),
             };
 
         let embed_tokens_weight = tensor_store.tensor_f32("model.embed_tokens.weight")?;
@@ -350,19 +351,16 @@ impl Model {
     }
 }
 
-fn maybe_metal_weights(weights: Weights, use_metal: bool) -> Weights {
+fn maybe_metal_weights(weights: Weights, use_metal: bool, in_features: usize) -> Weights {
     #[cfg(target_os = "macos")]
     {
-        if use_metal
-            && matches!(&weights, Weights::F32(_) | Weights::Bf16(_))
-            && let Some(metal) = crate::matmul::get_metal_ref()
-        {
-            return weights.to_metal(metal);
+        if use_metal && let Some(metal) = crate::matmul::get_metal_ref() {
+            return weights.to_metal(metal, in_features);
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    let _ = use_metal;
+    let _ = (use_metal, in_features);
 
     weights
 }
@@ -566,6 +564,8 @@ fn dequantize_weights(weights: Weights) -> Vec<f32> {
         Weights::MetalF32 { .. } => panic!("cannot dequantize MetalF32 weights"),
         #[cfg(target_os = "macos")]
         Weights::MetalBf16 { .. } => panic!("cannot dequantize MetalBf16 weights"),
+        #[cfg(target_os = "macos")]
+        Weights::MetalInt8 { .. } => panic!("cannot dequantize MetalInt8 weights"),
     }
 }
 

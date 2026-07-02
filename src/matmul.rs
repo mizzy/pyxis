@@ -18,6 +18,39 @@ pub fn get_metal_ref() -> Option<&'static crate::metal_matmul::MetalMatmul> {
     get_metal()
 }
 
+#[cfg(target_os = "macos")]
+fn metal_matmul_dispatch(
+    input: &[f32],
+    weight: &Weights,
+    out_features: usize,
+    in_features: usize,
+) -> Option<Vec<f32>> {
+    let metal = match weight {
+        Weights::MetalF32 { .. } | Weights::MetalBf16 { .. } | Weights::MetalInt8 { .. } => {
+            get_metal().expect("Metal weights require Metal device")
+        }
+        _ => return None,
+    };
+
+    Some(match weight {
+        Weights::MetalF32 { buffer, .. } => {
+            metal.matmul_with_buffer(input, buffer, out_features, in_features)
+        }
+        Weights::MetalBf16 { buffer, .. } => {
+            metal.matmul_bf16_with_buffer(input, buffer, out_features, in_features)
+        }
+        Weights::MetalInt8 {
+            data,
+            scales,
+            block_size,
+            ..
+        } => {
+            metal.matmul_q8_with_buffer(input, data, scales, *block_size, out_features, in_features)
+        }
+        _ => unreachable!(),
+    })
+}
+
 pub fn matmul(
     input: &[f32],
     weight: &Weights,
@@ -50,18 +83,8 @@ pub fn matmul(
     }
 
     #[cfg(target_os = "macos")]
-    if let Weights::MetalF32 { buffer, .. } = weight {
-        if let Some(metal) = get_metal() {
-            return metal.matmul_with_buffer(input, buffer, out_features, in_features);
-        }
-        panic!("MetalF32 weights require Metal device");
-    }
-    #[cfg(target_os = "macos")]
-    if let Weights::MetalBf16 { buffer, .. } = weight {
-        if let Some(metal) = get_metal() {
-            return metal.matmul_bf16_with_buffer(input, buffer, out_features, in_features);
-        }
-        panic!("MetalBf16 weights require Metal device");
+    if let Some(result) = metal_matmul_dispatch(input, weight, out_features, in_features) {
+        return result;
     }
 
     (0..out_features)
@@ -88,9 +111,11 @@ pub fn matmul(
                     ..
                 } => dot_product_int4(input, data, scales, *block_size, row_start, in_features),
                 #[cfg(target_os = "macos")]
-                Weights::MetalF32 { .. } => unreachable!("MetalF32 weights are handled above"),
-                #[cfg(target_os = "macos")]
-                Weights::MetalBf16 { .. } => unreachable!("MetalBf16 weights are handled above"),
+                Weights::MetalF32 { .. }
+                | Weights::MetalBf16 { .. }
+                | Weights::MetalInt8 { .. } => {
+                    unreachable!("Metal weights are handled above")
+                }
             }
         })
         .collect()

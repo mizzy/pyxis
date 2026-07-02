@@ -52,6 +52,27 @@ fn cpu_matmul_f32(
         .collect()
 }
 
+fn metal_q8_matmul(
+    metal: &MetalMatmul,
+    input: &[f32],
+    weights: &Weights,
+    out_features: usize,
+    in_features: usize,
+) -> Vec<f32> {
+    let metal_weights = weights.to_metal(metal, in_features);
+    let Weights::MetalInt8 {
+        data,
+        scales,
+        block_size,
+        ..
+    } = metal_weights
+    else {
+        panic!("expected MetalInt8 weights");
+    };
+
+    metal.matmul_q8_with_buffer(input, &data, &scales, block_size, out_features, in_features)
+}
+
 #[test]
 fn metal_matmul_identity() {
     let Some(metal) = metal_matmul_or_skip() else {
@@ -143,6 +164,69 @@ fn metal_matmul_bf16_matches_cpu() {
 }
 
 #[test]
+fn metal_matmul_q8_matches_cpu() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 16;
+    let in_features = 64;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 7.0) - 3.0)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 17 + 11) % 23) as f32 / 7.0 - 1.5)
+        .collect();
+    let int8_weights = Weights::quantize_int8(&weight, 32);
+
+    let actual = metal_q8_matmul(&metal, &input, &int8_weights, out_features, in_features);
+    let expected = matmul(&input, &int8_weights, out_features, in_features);
+
+    assert_vec_close_with_tolerance(&actual, &expected, 1e-2);
+}
+
+#[test]
+fn metal_matmul_q8_single_block_rows_match_cpu() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 16;
+    let in_features = 16;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 9.0) / 3.0 - 1.25)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 23 + 3) % 31) as f32 / 11.0 - 1.4)
+        .collect();
+    let int8_weights = Weights::quantize_int8(&weight, in_features);
+
+    let actual = metal_q8_matmul(&metal, &input, &int8_weights, out_features, in_features);
+    let expected = matmul(&input, &int8_weights, out_features, in_features);
+
+    assert_vec_close_with_tolerance(&actual, &expected, 1e-2);
+}
+
+#[test]
+fn metal_matmul_q8_gguf_block_size() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let out_features = 16;
+    let in_features = 512;
+    let input: Vec<f32> = (0..in_features)
+        .map(|index| (index as f32 % 11.0) / 5.0 - 1.0)
+        .collect();
+    let weight: Vec<f32> = (0..out_features * in_features)
+        .map(|index| ((index * 19 + 5) % 29) as f32 / 13.0 - 1.1)
+        .collect();
+    let int8_weights = Weights::quantize_int8(&weight, 32);
+
+    let actual = metal_q8_matmul(&metal, &input, &int8_weights, out_features, in_features);
+    let expected = matmul(&input, &int8_weights, out_features, in_features);
+
+    assert_vec_close_with_tolerance(&actual, &expected, 1e-2);
+}
+
+#[test]
 fn metal_matmul_matches_cpu_transformer_dimensions() {
     let Some(metal) = metal_matmul_or_skip() else {
         return;
@@ -217,7 +301,7 @@ fn weights_to_metal_f32() {
     };
     let weights = Weights::F32(vec![1.0, 2.0, 3.0, 4.0]);
 
-    let metal_weights = weights.to_metal(&metal);
+    let metal_weights = weights.to_metal(&metal, 4);
 
     assert_eq!(metal_weights.len(), 4);
     let Weights::MetalF32 { len, .. } = metal_weights else {
@@ -233,7 +317,7 @@ fn weights_to_metal_bf16() {
     };
     let weights = Weights::Bf16(vec![f32_to_bf16(1.5), f32_to_bf16(-2.0)]);
 
-    let metal_weights = weights.to_metal(&metal);
+    let metal_weights = weights.to_metal(&metal, 2);
 
     assert_eq!(metal_weights.len(), 2);
     let Weights::MetalBf16 { buffer, len } = metal_weights else {
@@ -250,10 +334,57 @@ fn weights_to_metal_bf16_creates_metal_bf16() {
     };
     let weights = Weights::Bf16(vec![f32_to_bf16(0.5), f32_to_bf16(4.0), f32_to_bf16(-8.0)]);
 
-    let metal_weights = weights.to_metal(&metal);
+    let metal_weights = weights.to_metal(&metal, 3);
 
     let Weights::MetalBf16 { len, .. } = metal_weights else {
         panic!("expected MetalBf16 weights");
     };
     assert_eq!(len, 3);
+}
+
+#[test]
+fn weights_to_metal_int8_creates_metal_int8() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let weights = Weights::quantize_int8(&[0.5, 4.0, -8.0, 1.25, -3.5], 5);
+
+    let metal_weights = weights.to_metal(&metal, 5);
+
+    assert_eq!(metal_weights.len(), 5);
+    let Weights::MetalInt8 {
+        data,
+        scales,
+        block_size,
+        len,
+    } = metal_weights
+    else {
+        panic!("expected MetalInt8 weights");
+    };
+    assert_eq!(len, 5);
+    assert_eq!(block_size, 5);
+    assert_eq!(data.length(), 5);
+    assert_eq!(scales.length(), std::mem::size_of::<f32>() as u64);
+}
+
+#[test]
+fn weights_to_metal_int8_incompatible_layout_stays_int8() {
+    let Some(metal) = metal_matmul_or_skip() else {
+        return;
+    };
+    let weight: Vec<f32> = (0..16).map(|index| index as f32 - 8.0).collect();
+    let weights = Weights::quantize_int8(&weight, 4);
+
+    let metal_weights = weights.to_metal(&metal, 16);
+
+    let Weights::Int8 {
+        block_size,
+        num_elements,
+        ..
+    } = metal_weights
+    else {
+        panic!("expected Int8 weights to stay on CPU");
+    };
+    assert_eq!(block_size, 4);
+    assert_eq!(num_elements, 16);
 }
