@@ -29,6 +29,13 @@ pub enum Weights {
         buffer: Buffer,
         len: usize,
     },
+    #[cfg(target_os = "macos")]
+    MetalInt8 {
+        data: Buffer,
+        scales: Buffer,
+        block_size: usize,
+        len: usize,
+    },
 }
 
 impl Weights {
@@ -42,6 +49,8 @@ impl Weights {
             Self::MetalF32 { len, .. } => *len,
             #[cfg(target_os = "macos")]
             Self::MetalBf16 { len, .. } => *len,
+            #[cfg(target_os = "macos")]
+            Self::MetalInt8 { len, .. } => *len,
         }
     }
 
@@ -59,11 +68,13 @@ impl Weights {
             Self::MetalF32 { .. } => panic!("cannot get f32 slice from MetalF32 weights"),
             #[cfg(target_os = "macos")]
             Self::MetalBf16 { .. } => panic!("cannot get f32 slice from MetalBf16 weights"),
+            #[cfg(target_os = "macos")]
+            Self::MetalInt8 { .. } => panic!("cannot get f32 slice from MetalInt8 weights"),
         }
     }
 
     #[cfg(target_os = "macos")]
-    pub fn to_metal(&self, metal: &crate::metal_matmul::MetalMatmul) -> Self {
+    pub fn to_metal(&self, metal: &crate::metal_matmul::MetalMatmul, in_features: usize) -> Self {
         match self {
             Self::F32(data) => {
                 let buffer = metal.create_buffer(data);
@@ -82,12 +93,32 @@ impl Weights {
                     len: data.len(),
                 }
             }
-            Self::Int8 { .. }
-            | Self::Int4 { .. }
-            | Self::MetalF32 { .. }
-            | Self::MetalBf16 { .. } => {
-                panic!("to_metal only supports F32 and Bf16 weights")
+            Self::Int8 {
+                data,
+                scales,
+                block_size,
+                num_elements,
+            } => {
+                let is_metal_compatible = *block_size > 0
+                    && ((*block_size == 32 && in_features.is_multiple_of(32))
+                        || *block_size == in_features);
+                if !is_metal_compatible {
+                    return self.clone();
+                }
+
+                let data = metal.create_buffer_raw(data.as_ptr() as *const c_void, data.len());
+                let scales = metal.create_buffer(scales);
+                Self::MetalInt8 {
+                    data,
+                    scales,
+                    block_size: *block_size,
+                    len: *num_elements,
+                }
             }
+            Self::Int4 { .. }
+            | Self::MetalF32 { .. }
+            | Self::MetalBf16 { .. }
+            | Self::MetalInt8 { .. } => self.clone(),
         }
     }
 

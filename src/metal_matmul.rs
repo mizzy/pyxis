@@ -3,6 +3,8 @@ use std::ffi::c_void;
 use std::mem;
 
 const THREADS_PER_ROW: u64 = 256;
+const SIMD_WIDTH: u64 = 32;
+const SIMD_GROUPS_PER_THREADGROUP: u64 = THREADS_PER_ROW / SIMD_WIDTH;
 const INPUT_TILE_ELEMENTS: u64 = 4096;
 
 fn shader_source() -> String {
@@ -12,13 +14,18 @@ fn shader_source() -> String {
 using namespace metal;
 
 constant uint THREADS_PER_ROW = {threads_per_row};
-constant uint SIMD_WIDTH = 32;
+constant uint SIMD_WIDTH = {simd_width};
 constant uint INPUT_TILE_ELEMENTS = {input_tile_elements};
 constant uint SIMD_GROUPS_PER_ROW = THREADS_PER_ROW / SIMD_WIDTH;
 
 static inline float4 load_float4(device const float* values, uint offset) {{
     packed_float4 packed = *(reinterpret_cast<device const packed_float4*>(values + offset));
     return float4(packed);
+}}
+
+static inline char4 load_char4(device const char* values, uint offset) {{
+    packed_char4 packed = *(reinterpret_cast<device const packed_char4*>(values + offset));
+    return char4(packed);
 }}
 
 static inline float bf16_to_f32(ushort value) {{
@@ -182,10 +189,79 @@ kernel void matmul_bf16(
         output[row] = total;
     }}
 }}
+
+kernel void matmul_q8(
+    device const float* input [[buffer(0)]],
+    device const char* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& in_features [[buffer(3)]],
+    constant uint& out_features [[buffer(4)]],
+    device const float* scales [[buffer(5)]],
+    constant uint& block_size [[buffer(6)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{{
+    uint row = gid.y * SIMD_GROUPS_PER_ROW + simd_group;
+    if (row >= out_features) return;
+
+    uint blocks_per_row = in_features / block_size;
+    uint row_start = row * in_features;
+    uint row_block_start = row * blocks_per_row;
+
+    float sum = 0.0;
+
+    if (blocks_per_row == 1) {{
+        uint vec4_count = in_features / 4;
+        for (uint v = simd_lane; v < vec4_count; v += SIMD_WIDTH) {{
+            uint o = v * 4;
+            float4 in_vec = load_float4(input, o);
+            char4 w = load_char4(weight, row_start + o);
+            sum += dot(in_vec, float4(w));
+        }}
+        for (uint o = vec4_count * 4 + simd_lane; o < in_features; o += SIMD_WIDTH) {{
+            sum += input[o] * (float)(weight[row_start + o]);
+        }}
+        sum *= scales[row_block_start];
+    }} else {{
+        uint lane_block = simd_lane / 4;
+        uint lane_off = (simd_lane % 4) * 8;
+        uint blocks_per_iter = SIMD_WIDTH / 4;
+        for (uint ib = lane_block; ib < blocks_per_row; ib += blocks_per_iter) {{
+            float scale = scales[row_block_start + ib];
+            uint base = ib * block_size + lane_off;
+            float4 in0 = load_float4(input + base, 0);
+            char4 w0 = load_char4(weight, row_start + base);
+            float4 in1 = load_float4(input + base, 4);
+            char4 w1 = load_char4(weight, row_start + base + 4);
+            sum += (dot(in0, float4(w0)) + dot(in1, float4(w1))) * scale;
+        }}
+    }}
+
+    sum = simd_sum(sum);
+
+    if (simd_lane == 0) {{
+        output[row] = sum;
+    }}
+}}
 "#,
         threads_per_row = THREADS_PER_ROW,
+        simd_width = SIMD_WIDTH,
         input_tile_elements = INPUT_TILE_ELEMENTS,
     )
+}
+
+#[derive(Clone, Copy)]
+struct MatmulShape {
+    out_features: usize,
+    in_features: usize,
+}
+
+#[derive(Clone, Copy)]
+enum KernelKind<'a> {
+    Dense,
+    Q8 { scales: &'a Buffer, block_size: u32 },
 }
 
 pub struct MetalMatmul {
@@ -193,6 +269,7 @@ pub struct MetalMatmul {
     command_queue: CommandQueue,
     pipeline_f32: ComputePipelineState,
     pipeline_bf16: ComputePipelineState,
+    pipeline_q8: ComputePipelineState,
 }
 
 impl MetalMatmul {
@@ -211,12 +288,20 @@ impl MetalMatmul {
         let pipeline_bf16 = device
             .new_compute_pipeline_state_with_function(&function_bf16)
             .ok()?;
+        let function_q8 = library.get_function("matmul_q8", None).ok()?;
+        let pipeline_q8 = device
+            .new_compute_pipeline_state_with_function(&function_q8)
+            .ok()?;
+        if pipeline_q8.thread_execution_width() != SIMD_WIDTH {
+            return None;
+        }
 
         Some(Self {
             device,
             command_queue,
             pipeline_f32,
             pipeline_bf16,
+            pipeline_q8,
         })
     }
 
@@ -261,9 +346,12 @@ impl MetalMatmul {
             &self.pipeline_f32,
             input,
             weight_buffer,
-            out_features,
-            in_features,
+            MatmulShape {
+                out_features,
+                in_features,
+            },
             mem::size_of::<f32>(),
+            KernelKind::Dense,
         )
     }
 
@@ -278,9 +366,53 @@ impl MetalMatmul {
             &self.pipeline_bf16,
             input,
             weight_buffer,
-            out_features,
-            in_features,
+            MatmulShape {
+                out_features,
+                in_features,
+            },
             mem::size_of::<u16>(),
+            KernelKind::Dense,
+        )
+    }
+
+    pub fn matmul_q8_with_buffer(
+        &self,
+        input: &[f32],
+        weight_buffer: &Buffer,
+        scales_buffer: &Buffer,
+        block_size: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Vec<f32> {
+        assert!(block_size > 0);
+        assert!(
+            block_size == 32 || block_size == in_features,
+            "Q8 Metal kernel supports block_size 32 (GGUF Q8_0) or per-row scales"
+        );
+        assert!(
+            in_features.is_multiple_of(block_size),
+            "in_features must be a multiple of block_size for the Q8 Metal kernel"
+        );
+        assert_eq!(
+            scales_buffer.length(),
+            ((out_features * in_features).div_ceil(block_size) * mem::size_of::<f32>()) as u64
+        );
+        let block_size_u32 =
+            u32::try_from(block_size).expect("block_size exceeds Metal shader uint range");
+
+        self.matmul_with_pipeline(
+            &self.pipeline_q8,
+            input,
+            weight_buffer,
+            MatmulShape {
+                out_features,
+                in_features,
+            },
+            mem::size_of::<i8>(),
+            KernelKind::Q8 {
+                scales: scales_buffer,
+                block_size: block_size_u32,
+            },
         )
     }
 
@@ -289,10 +421,14 @@ impl MetalMatmul {
         pipeline: &ComputePipelineState,
         input: &[f32],
         weight_buffer: &Buffer,
-        out_features: usize,
-        in_features: usize,
+        shape: MatmulShape,
         weight_element_size: usize,
+        kind: KernelKind<'_>,
     ) -> Vec<f32> {
+        let MatmulShape {
+            out_features,
+            in_features,
+        } = shape;
         assert_eq!(input.len(), in_features);
         assert_eq!(
             weight_buffer.length(),
@@ -335,14 +471,31 @@ impl MetalMatmul {
             mem::size_of::<u32>() as u64,
             &out_features_u32 as *const u32 as *const c_void,
         );
-        encoder
-            .set_threadgroup_memory_length(0, INPUT_TILE_ELEMENTS * mem::size_of::<f32>() as u64);
+        let (rows_per_threadgroup, uses_threadgroup_memory) = match kind {
+            KernelKind::Dense => (1, true),
+            KernelKind::Q8 { scales, block_size } => {
+                encoder.set_buffer(5, Some(scales), 0);
+                encoder.set_bytes(
+                    6,
+                    mem::size_of::<u32>() as u64,
+                    &block_size as *const u32 as *const c_void,
+                );
+                (SIMD_GROUPS_PER_THREADGROUP, false)
+            }
+        };
+        if uses_threadgroup_memory {
+            encoder.set_threadgroup_memory_length(
+                0,
+                INPUT_TILE_ELEMENTS * mem::size_of::<f32>() as u64,
+            );
+        }
 
         assert!(
             pipeline.max_total_threads_per_threadgroup() >= THREADS_PER_ROW,
             "Metal device does not support {THREADS_PER_ROW} threads per threadgroup"
         );
-        let grid_size = MTLSize::new(THREADS_PER_ROW, out_features as u64, 1);
+        let grid_y = (out_features as u64).div_ceil(rows_per_threadgroup);
+        let grid_size = MTLSize::new(THREADS_PER_ROW, grid_y, 1);
         let threadgroup_size = MTLSize::new(THREADS_PER_ROW, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
